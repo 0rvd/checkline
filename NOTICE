@@ -1,0 +1,21 @@
+Checkline - third-party notices
+
+Checkline is proprietary (see LICENSE). It uses the following third-party components,
+which remain under their own licenses. None of them is copied into this repository.
+
+Loaded by the browser at runtime
+  - supabase-js 2.45.4 (only when online play is configured)
+    https://github.com/supabase/supabase-js - MIT License
+  - Fonts from Google Fonts: IBM Plex Sans, IBM Plex Sans Arabic, Outfit
+    SIL Open Font License 1.1
+
+Development tools (installed by npm, not shipped with the game)
+  - TypeScript - Apache License 2.0
+  - @types/node - MIT License
+
+Services
+  - Supabase (database, authentication, realtime), used under the account holder's
+    own Supabase terms of service.
+
+All piece illustrations, the ball, nets, pitch art, sound effects and user-interface
+designs in this repository are original works created for Checkline.
