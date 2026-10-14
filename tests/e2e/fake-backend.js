@@ -130,11 +130,17 @@
       u.password = password;
     },
     onAuthEvent(cb) { authListeners.add(cb); return () => authListeners.delete(cb); },
+    async nameAvailable(name) {
+      await delay(cfg.latency / 2);
+      const n = String(name).trim().toLowerCase();
+      return ![...profiles.values()].some((p) => p.id !== session?.userId && p.displayName.trim().toLowerCase() === n);
+    },
     async saveProfile(name) {
       await delay(cfg.latency);
       if (!session) throw err('not_signed_in');
       const n = String(name).trim();
       if (n.length < 2 || n.length > 24) throw err('invalid_name');
+      if (!(await this.nameAvailable(n))) throw err('name_taken');
       const p = profiles.get(ME()) ?? { id: ME(), rating: 1200, wins: 0, draws: 0, losses: 0, games: 0 };
       p.displayName = n;
       profiles.set(ME(), p);

@@ -33,6 +33,7 @@ const SHAPES: Record<PieceKind, string> = {
 export const SVG_DEFS = `<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
   <linearGradient id="cl-fig-dark" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a342b"/><stop offset="1" stop-color="#16130f"/></linearGradient>
   <linearGradient id="cl-fig-light" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff9ec"/><stop offset=".6" stop-color="#efe3c8"/><stop offset="1" stop-color="#cdb98f"/></linearGradient>
+  <linearGradient id="cl-fig-gold" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff1c2"/><stop offset=".55" stop-color="#e2b45a"/><stop offset="1" stop-color="#9a6e22"/></linearGradient>
   <radialGradient id="cl-ball" cx=".35" cy=".3" r=".8"><stop offset="0" stop-color="#fff"/><stop offset=".7" stop-color="#e9e9e9"/><stop offset="1" stop-color="#9a9a9a"/></radialGradient>
 </defs></svg>`;
 

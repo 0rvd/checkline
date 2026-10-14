@@ -139,6 +139,7 @@ export type OnlineErrorCode =
   | 'email_disabled'
   | 'link_expired'
   | 'email_not_authorized'
+  | 'name_taken'
   | 'anonymous_disabled'
   | 'library_failed'
   | 'network'
@@ -213,6 +214,8 @@ export interface OnlineBackend {
   /** Set a new password (after arriving from a reset link, or while signed in). */
   updatePassword(password: string): Promise<void>;
   onAuthEvent(cb: (e: AuthEvent) => void): () => void;
+  /** Is this display name free? (Names are unique, ignoring case.) */
+  nameAvailable(name: string): Promise<boolean>;
   /** Create or rename the player's public profile (display name). */
   saveProfile(displayName: string): Promise<OnlineProfile>;
   myProfile(): Promise<OnlineProfile | null>;
@@ -380,6 +383,10 @@ export class SupabaseBackend implements OnlineBackend {
   onAuthEvent(cb: (e: AuthEvent) => void): () => void {
     this.listeners.add(cb);
     return () => this.listeners.delete(cb);
+  }
+
+  nameAvailable(name: string): Promise<boolean> {
+    return this.call<boolean>('cl_name_available', { p_name: name });
   }
 
   async saveProfile(displayName: string): Promise<OnlineProfile> {

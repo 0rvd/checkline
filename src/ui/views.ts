@@ -4,6 +4,7 @@ import { escapeHtml as esc, getLang, t, tHtml, teamName, type MessageKey } from 
 import type { AuthSession, LeaderboardPage, OnlineError, OnlineMatch, OnlineProfile } from '../online/backend.js';
 import type { ConfigProblem } from '../online/config.js';
 import type { PieceKind, Team } from '../rules/types.js';
+import { MATCHES_PER_BONUS, MATCH_BONUS, SHOP_ITEMS, WIN_BONUS, equipped, owns, type ShopItem, type Wallet } from './economy.js';
 import { BALL_SVG, pieceSvg } from './pieces.js';
 
 export function langSwitch(): string {
@@ -59,25 +60,25 @@ function accountChip(a: MenuAccount | null): string {
       <span class="avatar" aria-hidden="true">${esc([...name][0]?.toUpperCase() ?? '?')}</span><bdi>${esc(name)}</bdi></button>`;
 }
 
-export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: MenuAccount | null }): string {
-  const modeIcons: Record<string, string> = {
-    'ai-setup': '🧠',
-    'play-local': '👥',
-    online: '🌐',
-    leaderboard: '🏆',
-    tutorial: '📚',
-    rules: '📖',
-  };
+/** Small gold coin (original vector art). */
+export function coinIcon(): string {
+  return `<svg class="coin" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.5"/><circle cx="12" cy="12" r="7.2" class="rim"/><path d="M12 7.6 L13.4 10.6 L16.6 11 L14.2 13.2 L14.8 16.4 L12 14.8 L9.2 16.4 L9.8 13.2 L7.4 11 L10.6 10.6 Z" class="star"/></svg>`;
+}
+
+function coinChip(coins: number): string {
+  return `<button class="coin-chip" data-act="shop" title="${esc(t('menu.shop'))}">${coinIcon()}<span dir="ltr">${coins}</span></button>`;
+}
+
+export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: MenuAccount | null; coins?: number }): string {
   const item = (act: string, title: MessageKey, sub: MessageKey, cls = '', extra = '') => `
     <button class="mode-card ${cls}" data-act="${act}">
-      <span class="mode-heading"><span class="mode-icon" aria-hidden="true">${modeIcons[act] ?? '⚽'}</span><span class="mode-title">${esc(t(title))}</span></span>
+      <span class="mode-title">${esc(t(title))}</span>
       <span class="mode-sub">${esc(t(sub))}</span>${extra}
     </button>`;
   const feats: MessageKey[] = ['menu.feat.dribble', 'menu.feat.pass', 'menu.feat.shoot', 'menu.feat.tackle'];
-  const featIcons = ['⚽', '🧭', '🎯', '🛡️'];
   return `
     <main class="menu screen-enter">
-      <div class="menu-top">${accountChip(o.account ?? null)}${langSwitch()}</div>
+      <div class="menu-top">${coinChip(o.coins ?? 0)}${accountChip(o.account ?? null)}${langSwitch()}</div>
       <div class="menu-card">
         <div class="menu-hero">
           <div class="menu-copy">
@@ -85,7 +86,7 @@ export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: Me
             <h1 class="wordmark" dir="ltr">CHECK<span>LINE</span></h1>
             <p class="tagline">${esc(t('app.tagline'))}</p>
             <p class="pitchline">${esc(t('app.pitchline'))}</p>
-            <ul class="feats">${feats.map((k, i) => `<li><span aria-hidden="true">${featIcons[i]}</span>${esc(t(k))}</li>`).join('')}</ul>
+            <ul class="feats">${feats.map((k) => `<li>${esc(t(k))}</li>`).join('')}</ul>
           </div>
           ${heroPitch()}
         </div>
@@ -96,7 +97,11 @@ export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: Me
           ${item('online', 'menu.online', o.onlineOk ? 'menu.online.sub' : 'menu.online.off', o.onlineOk ? '' : 'muted-card')}
           ${item('leaderboard', 'menu.leaderboard', o.onlineOk ? 'menu.leaderboard.sub' : 'menu.online.off', o.onlineOk ? '' : 'muted-card')}
           ${item('tutorial', 'menu.tutorial', 'menu.tutorial.sub')}
-          <button class="mode-card ghost" data-act="rules"><span class="mode-heading"><span class="mode-icon" aria-hidden="true">${modeIcons.rules}</span><span class="mode-title">${esc(t('menu.rules'))}</span></span></button>
+          <button class="mode-card shop-card" data-act="shop">
+            <span class="mode-title">${coinIcon()}${esc(t('menu.shop'))}</span>
+            <span class="mode-sub">${esc(t('menu.shop.sub', { n: o.coins ?? 0 }))}</span>
+          </button>
+          <button class="mode-card ghost" data-act="rules"><span class="mode-title">${esc(t('menu.rules'))}</span></button>
         </div>
         <p class="fine">${esc(t('menu.fine'))}</p>
       </div>
@@ -107,7 +112,6 @@ export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: Me
 export function renderAiSetup(o: { difficulty: Difficulty; side: Team | 'random' }): string {
   const levels: Difficulty[] = ['easy', 'medium', 'hard'];
   const bars = { easy: 1, medium: 2, hard: 3 };
-  const levelIcons = { easy: '🌱', medium: '⚔️', hard: '🔥' };
   const sides: (Team | 'random')[] = ['A', 'B', 'random'];
   return `
     <main class="page screen-enter">
@@ -123,7 +127,7 @@ export function renderAiSetup(o: { difficulty: Difficulty; side: Team | 'random'
             .map(
               (d) => `
             <button class="choice ${o.difficulty === d ? 'on' : ''}" role="radio" aria-checked="${o.difficulty === d}" data-act="pick-difficulty" data-value="${d}">
-              <span class="choice-head"><span class="choice-title"><span class="choice-emoji" aria-hidden="true">${levelIcons[d]}</span>${esc(t(`ai.${d}` as MessageKey))}</span>
+              <span class="choice-head"><span class="choice-title">${esc(t(`ai.${d}` as MessageKey))}</span>
                 <span class="meter" aria-hidden="true">${[1, 2, 3].map((i) => `<i class="${i <= bars[d] ? 'on' : ''}"></i>`).join('')}</span></span>
               <span class="choice-desc">${esc(t(`ai.${d}.desc` as MessageKey))}</span>
             </button>`,
@@ -519,5 +523,69 @@ export function renderLeaderboard(s: LeaderboardScreen): string {
       <p class="muted explain">${esc(t('lb.explain'))}</p>
       ${me}
       ${body}
+    </main>`;
+}
+
+// ------------------------------------------------------------------ shop
+/** Mini pitch showing a floor theme (uses the same CSS variables as the real pitch). */
+function floorPreview(id: string): string {
+  return `<div class="floor-preview theme-floor-${id}" aria-hidden="true">
+      <div class="fp-net"></div>
+      <div class="fp-grid">${'<i></i>'.repeat(24)}</div>
+      <svg class="fp-lines" viewBox="0 0 6 4" preserveAspectRatio="none"><rect x="1" y="0.04" width="4" height="1.2" vector-effect="non-scaling-stroke"/><line x1="0" y1="3.96" x2="6" y2="3.96" vector-effect="non-scaling-stroke"/><circle cx="3" cy="4" r="1" vector-effect="non-scaling-stroke"/></svg>
+    </div>`;
+}
+
+/** Two sample pieces (one per team) wearing a skin. */
+function skinPreview(id: string): string {
+  return `<div class="skin-preview theme-skin-${id}" aria-hidden="true">
+      <div class="token team-A kind-queen carrier">${pieceSvg('queen')}<span class="ball">${BALL_SVG}</span></div>
+      <div class="token team-B kind-knight">${pieceSvg('knight')}</div>
+    </div>`;
+}
+
+function shopCard(w: Wallet, it: ShopItem): string {
+  const has = owns(w, it.kind, it.id);
+  const on = equipped(w, it.kind) === it.id;
+  const affordable = w.coins >= it.price;
+  const name = t(`${it.kind}.${it.id}.name` as MessageKey);
+  let button: string;
+  if (on) button = `<button class="btn small equipped-btn" disabled>✓ ${esc(t('shop.equipped'))}</button>`;
+  else if (has) button = `<button class="btn small" data-act="shop-item" data-kind="${it.kind}" data-id="${it.id}">${esc(t('shop.equip'))}</button>`;
+  else if (affordable)
+    button = `<button class="btn small primary" data-act="shop-item" data-kind="${it.kind}" data-id="${it.id}">${esc(t('shop.unlock'))} · ${coinIcon()}<span dir="ltr">${it.price}</span></button>`;
+  else button = `<button class="btn small" disabled><span aria-hidden="true">🔒</span> ${esc(t('shop.need', { n: it.price }))}</button>`;
+  const tag = on ? 'equipped' : has ? 'owned' : 'locked';
+  const tagText = on ? t('shop.equipped') : has ? (it.price === 0 ? t('shop.free') : t('shop.owned')) : '';
+  return `
+    <article class="shop-item ${tag}" aria-label="${esc(name)}">
+      ${it.kind === 'floor' ? floorPreview(it.id) : skinPreview(it.id)}
+      <div class="shop-info">
+        <div class="shop-name"><strong>${esc(name)}</strong>${tagText ? `<span class="shop-tag">${esc(tagText)}</span>` : `<span class="price">${coinIcon()}<span dir="ltr">${it.price}</span></span>`}</div>
+        <p class="muted small">${esc(t(`${it.kind}.${it.id}.desc` as MessageKey))}</p>
+      </div>
+      ${button}
+    </article>`;
+}
+
+export function renderShop(w: Wallet): string {
+  const toNext = MATCHES_PER_BONUS - (w.matches % MATCHES_PER_BONUS);
+  const pips = Array.from({ length: MATCHES_PER_BONUS }, (_, i) => `<i class="${i < MATCHES_PER_BONUS - toNext ? 'on' : ''}"></i>`).join('');
+  const section = (kind: 'floor' | 'skin', title: MessageKey) => `
+      <h2 class="section-label">${esc(t(title))}</h2>
+      <div class="shop-grid">${SHOP_ITEMS.filter((i) => i.kind === kind).map((i) => shopCard(w, i)).join('')}</div>`;
+  return `
+    <main class="page shop screen-enter">
+      ${head('shop.title')}
+      <section class="card wallet-card">
+        <div class="wallet-balance">${coinIcon()}<strong dir="ltr">${w.coins}</strong><span class="muted">${esc(t('shop.coins'))}</span></div>
+        <div class="wallet-earn">
+          <p class="small">${esc(t('shop.earn', { win: WIN_BONUS, bonus: MATCH_BONUS, every: MATCHES_PER_BONUS }))}</p>
+          <div class="bonus-meter" aria-label="${esc(t('shop.nextBonus', { n: toNext }))}"><span class="pips">${pips}</span><span class="small muted">${esc(t('shop.nextBonus', { n: toNext }))}</span></div>
+        </div>
+      </section>
+      ${section('floor', 'shop.floors')}
+      ${section('skin', 'shop.skins')}
+      <p class="fine">${esc(t('shop.note'))}</p>
     </main>`;
 }

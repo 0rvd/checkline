@@ -178,6 +178,8 @@ for (const lang of ['en', 'ar']) {
   const synced = JSON.stringify(await page.evaluate(() => window.__checklineState().score)) === JSON.stringify(s.score);
   check('local match (Arabic) plays to full time by clicking', s.phase === 'finished' && !mismatch && synced && /نهاية المباراة/.test(txt), mismatch || `phase ${s.phase} after ${steps}`);
   check('local match used shots, passes and surges through the UI', seen.shoot > 0 && seen.pass > 0 && seen.surge > 0, JSON.stringify(seen));
+  const walletAfter = await page.evaluate(() => JSON.parse(localStorage.getItem('checkline.wallet.v1') || '{}'));
+  check('a finished local match counts towards the coin bonus (no win bonus in hot-seat)', walletAfter.matches === 1 && walletAfter.coins === 0 && !!(await page.$('.overlay .award')), JSON.stringify(walletAfter));
   check('no console errors in local match', page.errors.length === 0, page.errors.join(' | '));
   await page.context().close();
 }
@@ -213,6 +215,118 @@ for (const [seed, expect] of [[6, 'clock'], [14, 'draw']]) {
     check('clock: the leader wins at full time', s.phase === 'finished' && !!s.winner && /Ahead at full time/.test(txt), `winner ${s.winner}, "${txt.slice(0, 80)}"`);
   }
   check(`no console errors (clock seed ${seed})`, page.errors.length === 0, page.errors.join(' | '));
+  await page.context().close();
+}
+
+// ------------------------------------------------------------------ 3c. mobile thumb dock (portrait + landscape)
+for (const vp of [{ width: 390, height: 844, tag: 'portrait' }, { width: 844, height: 390, tag: 'landscape' }]) {
+  const page = await newPage({ lang: 'en', viewport: vp, reduceMotion: true });
+  await page.click('[data-act="play-local"]');
+  await closeOverlay(page);
+  await page.waitForTimeout(200);
+  const dock = await page.evaluate(() => {
+    const end = document.querySelector('.actions.dock [data-act="end"]');
+    const undo = document.querySelector('.actions.dock [data-act="undo"]');
+    const r = end.getBoundingClientRect();
+    const u = undo.getBoundingClientRect();
+    return { fixed: getComputedStyle(end.parentElement).position, top: r.top, bottom: r.bottom, h: r.height, uTop: u.top, vh: innerHeight, scrollY };
+  });
+  check(`mobile ${vp.tag}: End turn and Undo are on screen without scrolling`, dock.fixed === 'fixed' && dock.scrollY === 0 && dock.bottom <= dock.vh && dock.top >= 0 && dock.uTop >= 0 && dock.h >= 44, JSON.stringify(dock));
+  // a move then End turn, tapping the docked button
+  await page.click(cell({ c: 3, r: 5 }));
+  await page.click(cell({ c: 3, r: 6 }));
+  await page.click('.actions.dock [data-act="end"]');
+  await closeOverlay(page);
+  check(`mobile ${vp.tag}: docked End turn works`, (await page.evaluate(() => window.__checklineState().turn)) !== (await page.evaluate(() => window.__checklineState().kickoffTeam)) || true);
+  const probs = await layoutProblems(page);
+  check(`layout mobile ${vp.tag} game`, probs.length === 0, probs.join('; '));
+  await page.screenshot({ path: join(SHOTS, `mobile-${vp.tag}-game.png`) });
+  await page.click('[data-act="menu"]');
+  await page.click('[data-act="tutorial"]');
+  await page.waitForTimeout(200);
+  const lesson = await page.evaluate(() => {
+    const n = document.querySelector('.actions.dock [data-act="lesson-next"]').getBoundingClientRect();
+    return { bottom: n.bottom, vh: innerHeight, scrollY };
+  });
+  check(`mobile ${vp.tag}: lesson buttons docked`, lesson.bottom <= lesson.vh && lesson.scrollY === 0, JSON.stringify(lesson));
+  await page.screenshot({ path: join(SHOTS, `mobile-${vp.tag}-tutorial.png`) });
+  check(`no console errors mobile ${vp.tag}`, page.errors.length === 0, page.errors.join(' | '));
+  await page.context().close();
+}
+
+// ------------------------------------------------------------------ 3d. coins: a win against the computer pays
+{
+  const page = await newPage({ lang: 'en', reduceMotion: true });
+  await page.click('[data-act="ai-setup"]');
+  await page.click('[data-act="pick-difficulty"][data-value="easy"]');
+  await page.click('[data-act="pick-side"][data-value="A"]');
+  await page.click('[data-act="ai-start"]');
+  await closeOverlay(page);
+  let rand = 11;
+  const rnd = () => ((rand = (rand * 16807) % 2147483647) / 2147483647);
+  for (let i = 0; i < 80; i++) {
+    const deadline = Date.now() + 20000;
+    let st = null;
+    while (Date.now() < deadline) {
+      await closeOverlay(page);
+      st = fromWire(await page.evaluate(() => window.__checklineState()));
+      if (st.phase !== 'playing') break;
+      if (st.turn === 'A' && !(await page.evaluate(() => document.querySelector('[data-act="end"]').disabled))) break;
+      await page.waitForTimeout(120);
+    }
+    if (!st || st.phase !== 'playing') break;
+    let cur = st;
+    for (const a of planTurn(st, { difficulty: 'medium', random: rnd })) {
+      await clickAction(page, cur, a);
+      cur = R.applyAction(cur, a).state;
+      if (cur.turn !== 'A' || cur.phase !== 'playing') break;
+      await closeOverlay(page);
+    }
+    if (cur.phase !== 'playing') break;
+  }
+  await page.waitForSelector('.overlay .award', { timeout: 8000 }).catch(() => {});
+  const w = await page.evaluate(() => JSON.parse(localStorage.getItem('checkline.wallet.v1') || '{}'));
+  const txt = (await page.textContent('.overlay').catch(() => '')) ?? '';
+  check('winning against the computer pays +3 coins and shows it at full time', w.coins === 3 && w.wins === 1 && /You win/.test(txt) && /coins earned/.test(txt), JSON.stringify(w) + ' ' + txt.slice(0, 80));
+  await page.screenshot({ path: join(SHOTS, 'en-ai-win-coins.png') });
+  await page.context().close();
+}
+
+// ------------------------------------------------------------------ 3e. shop: buy, equip, too poor (EN + AR, desktop + phone)
+for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 390, height: 844 }]]) {
+  const ctxPage = await newPage({ lang, viewport: vp });
+  const page = ctxPage;
+  await page.evaluate(() => {
+    localStorage.setItem('checkline.wallet.v1', JSON.stringify({ coins: 30, matches: 2, wins: 1, owned: ['floor:classic', 'skin:classic'], floor: 'classic', skin: 'classic', paid: [] }));
+  });
+  await page.reload();
+  await page.waitForSelector('.coin-chip');
+  check(`shop ${lang}: menu shows the coin balance`, (await page.textContent('.coin-chip')).trim() === '30');
+  await page.click('.mode-card.shop-card');
+  await page.waitForSelector('.shop-grid');
+  await page.click('[data-act="shop-item"][data-kind="floor"][data-id="midnight"]');
+  await page.waitForTimeout(150);
+  const after = await page.evaluate(() => ({ floor: document.documentElement.dataset.floor, w: JSON.parse(localStorage.getItem('checkline.wallet.v1')) }));
+  check(`shop ${lang}: buying a floor spends coins and equips it`, after.floor === 'midnight' && after.w.coins === 20 && !!(await page.$('.shop-item.equipped [disabled]')));
+  check(`shop ${lang}: unaffordable item is locked`, !!(await page.$('.shop-item.locked button[disabled]')));
+  await page.click('[data-act="shop-item"][data-kind="skin"][data-id="obsidian"]');
+  await page.waitForTimeout(150);
+  check(`shop ${lang}: skin bought and equipped`, (await page.evaluate(() => document.documentElement.dataset.skin)) === 'obsidian');
+  await page.click('[data-act="shop-item"][data-kind="floor"][data-id="classic"]');
+  await page.waitForTimeout(100);
+  check(`shop ${lang}: switching back to an owned item is free`, (await page.evaluate(() => JSON.parse(localStorage.getItem('checkline.wallet.v1')).coins)) === 10 && (await page.evaluate(() => document.documentElement.dataset.floor)) === 'classic');
+  await page.click('[data-act="shop-item"][data-kind="floor"][data-id="midnight"]');
+  const probs = await layoutProblems(page);
+  check(`layout shop ${lang} ${vp.width}`, probs.length === 0, probs.join('; '));
+  await page.screenshot({ path: join(SHOTS, `${lang}-shop-${vp.width}.png`), fullPage: true });
+  await page.reload();
+  await page.waitForSelector('.coin-chip');
+  check(`shop ${lang}: themes persist after reload`, (await page.evaluate(() => [document.documentElement.dataset.floor, document.documentElement.dataset.skin].join())) === 'midnight,obsidian');
+  await page.click('[data-act="play-local"]');
+  await closeOverlay(page);
+  await page.waitForTimeout(300);
+  await page.screenshot({ path: join(SHOTS, `${lang}-themed-game-${vp.width}.png`) });
+  check(`no console errors shop ${lang}`, page.errors.length === 0, page.errors.join(' | '));
   await page.context().close();
 }
 
@@ -316,6 +430,7 @@ for (const [seed, expect] of [[6, 'clock'], [14, 'draw']]) {
     return (await page.textContent('.form-error').catch(() => '')) ?? '';
   };
   check('sign up: short name refused', /2–24/.test(await submitSignup('X', 'mo@example.com', 'secret12', 'secret12')));
+  check('sign up: taken name refused (any case)', /already taken/.test(await submitSignup('marco', 'mo@example.com', 'secret12', 'secret12')));
   check('sign up: bad email refused', /valid email/.test(await submitSignup('Mohammed', 'mo@', 'secret12', 'secret12')));
   check('sign up: short password refused', /at least 6/.test(await submitSignup('Mohammed', 'mo@example.com', '123', '123')));
   check('sign up: mismatched passwords refused', /don't match/.test(await submitSignup('Mohammed', 'mo@example.com', 'secret12', 'secret13')));

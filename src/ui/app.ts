@@ -54,6 +54,7 @@ import { renderBoard } from './board.js';
 import { burstAt, confetti, flipTokens, flyBall, reducedMotion, setReduceMotion, snapshotTokens } from './motion.js';
 import { BALL_SVG, SVG_DEFS, moveDiagram, pieceSvg } from './pieces.js';
 import { play, setSoundEnabled } from './sound.js';
+import { applyTheme, awardMatch, buyOrEquip, findItem, loadWallet, type Award, type ItemKind, type Wallet } from './economy.js';
 import {
   errorText,
   langSwitch,
@@ -61,13 +62,15 @@ import {
   renderLeaderboard,
   renderMenu,
   renderOnline,
+  renderShop,
+  coinIcon,
   spinner,
   type AuthMode,
   type MenuAccount,
   type OnlineScreen,
 } from './views.js';
 
-type Screen = 'menu' | 'ai-setup' | 'game' | 'online' | 'leaderboard';
+type Screen = 'menu' | 'ai-setup' | 'game' | 'online' | 'leaderboard' | 'shop';
 type GameKind = 'local' | 'ai' | 'online' | 'tutorial';
 type Overlay =
   | { kind: 'handoff'; team: Team; opening?: boolean }
@@ -136,6 +139,13 @@ export class App {
   private lessonDone = false;
   private settings: Settings;
   private boardHasFocus = false;
+
+  // coins, shop and cosmetic themes (saved in this browser)
+  private wallet: Wallet = loadWallet();
+  /** Identifies the current match so it is paid at most once. */
+  private matchKey = '';
+  /** What the finished match paid (shown on the full-time screen). */
+  private lastAward: Award | null = null;
 
   // computer opponent
   private difficulty: Difficulty = 'medium';
@@ -209,6 +219,7 @@ export class App {
     this.settings = { rotate: false, handoff: true, reduceMotion: false, sound: true, ...saved };
     setReduceMotion(this.settings.reduceMotion);
     setSoundEnabled(this.settings.sound);
+    applyTheme(this.wallet);
     applyDocumentLang();
     if (!document.getElementById('cl-svg-defs')) {
       const holder = document.createElement('div');
@@ -251,6 +262,8 @@ export class App {
   }
 
   private beginGame(kind: GameKind, state: MatchState): void {
+    this.matchKey = `${kind}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    this.lastAward = null;
     this.cancelAi();
     this.kind = kind;
     this.game = state;
@@ -722,7 +735,11 @@ export class App {
     if (password.length < 6) return this.authError('weak_password');
     if (password !== password2) return this.authError('password_mismatch');
     this.ui.notice = null;
-    const res = await this.onlineBusy('signup', (be) => be.signUp(email, password, clean));
+    const res = await this.onlineBusy('signup', async (be) => {
+      // Display names are unique: check before creating the account.
+      if (!(await be.nameAvailable(clean))) throw new OnlineError('name_taken');
+      return be.signUp(email, password, clean);
+    });
     if (!res) return;
     if (res.needsConfirmation) {
       this.ui.pendingEmail = email.trim();
@@ -976,6 +993,7 @@ export class App {
       skewMs: Date.parse(m.serverNow) - Date.now(),
       outdated: !!m.rulesVersion && m.rulesVersion < 3,
     };
+    this.matchKey = `online-${m.id}`;
     if (m.status === 'active') store(ACTIVE_MATCH_KEY, m.id);
     this.log = (m.lastEvents ?? []).map((ev) => ({ ev }));
     if (m.status === 'finished') {
@@ -1498,6 +1516,12 @@ export class App {
       case 'leaderboard':
         this.openLeaderboard();
         return;
+      case 'shop':
+        this.goScreen('shop');
+        return;
+      case 'shop-item':
+        this.shopItem(el.dataset.kind as ItemKind, el.dataset.id ?? '');
+        return;
       case 'lb-prev':
         this.lb.page = Math.max(0, this.lb.page - 1);
         void this.loadLeaderboard();
@@ -1670,6 +1694,7 @@ export class App {
     const values = new Map<string, string>();
     this.root.querySelectorAll<HTMLInputElement>('input[id]:not([type=checkbox])').forEach((i) => values.set(i.id, i.value));
 
+    this.payFinishedMatch();
     const anim = this.anim;
     let html: string;
     switch (this.screen) {
@@ -1678,7 +1703,11 @@ export class App {
           onlineOk: this.onlineConfigured(),
           resume: !!store<string>(ACTIVE_MATCH_KEY) && this.onlineConfigured() && this.account?.state === 'signed-in',
           account: this.onlineConfigured() ? this.account : null,
+          coins: this.wallet.coins,
         });
+        break;
+      case 'shop':
+        html = renderShop(this.wallet);
         break;
       case 'ai-setup':
         html = renderAiSetup({ difficulty: this.difficulty, side: this.aiSide });
@@ -1950,7 +1979,7 @@ export class App {
     return `
       ${top}
       ${this.renderSelection()}
-      <div class="actions">
+      <div class="actions dock">
         ${undoBtn}
         <button class="btn primary ${g.ap === 0 && canEnd && !g.surge[g.turn] ? 'pulse' : ''}" data-act="end" ${canEnd ? '' : 'disabled'} title="${esc(t('tip.end'))}">${esc(t('act.endTurn'))}</button>
       </div>
@@ -1991,11 +2020,9 @@ export class App {
         }
       </div>
       ${this.renderSelection()}
-      <div class="actions">
+      <div class="actions dock lesson-dock">
         <button class="btn" data-act="undo" ${this.history.length ? '' : 'disabled'}>${esc(t('act.undo'))}</button>
         <button class="btn" data-act="lesson-reset">${esc(t('act.reset'))}</button>
-      </div>
-      <div class="actions">
         <button class="btn ghost" data-act="lesson-prev" ${this.lessonIndex === 0 ? 'disabled' : ''}>${esc(t('act.prev'))}</button>
         <button class="btn ${this.lessonDone ? 'primary pulse' : ''}" data-act="lesson-next">${esc(t(last ? 'act.playMatch' : 'act.next'))}</button>
       </div>
@@ -2019,7 +2046,7 @@ export class App {
         <button class="btn primary" data-act="close" data-primary>${esc(t(isAiTurn ? 'act.kickOff' : 'act.startTurn'))}</button>`;
     } else if (o.kind === 'goal') {
       body = `
-        <div class="goal-word" dir="ltr" aria-hidden="true"><span class="goal-emoji">⚽</span><span>GOAL</span><span class="goal-emoji">⚽</span></div>
+        <div class="goal-word" dir="ltr" aria-hidden="true">GOAL</div>
         <h2><span class="team-dot big ${o.team}"></span>${esc(t('ov.scores', { team: teamName(o.team) }))}</h2>
         <p class="bigscore" dir="ltr">${o.score.A} – ${o.score.B}</p>
         <p>${esc(t('ov.goalReset', { team: teamName(o.next), n: g.config.apPerTurn }))}</p>
@@ -2077,6 +2104,48 @@ export class App {
     return turnsPlayed(g) >= g.config.regulationTurns && g.turnNumber - 1 >= g.config.regulationTurns ? 'golden' : 'clock';
   }
 
+  // ================================================================== coins & shop
+
+  /** Pay coins once when a real match reaches full time (never in the tutorial). */
+  private payFinishedMatch(): void {
+    if (this.overlay?.kind !== 'win' || this.kind === 'tutorial' || !this.matchKey) return;
+    if (this.kind !== 'online' && this.game.phase !== 'finished') return;
+    if (this.kind === 'online' && this.og?.match.status !== 'finished') return;
+    const team = this.overlay.team;
+    // Win bonus when *you* won: against the computer or an online opponent. Local hot-seat
+    // matches count towards the match bonus only (both players share this device).
+    const won = !!team && ((this.kind === 'ai' && team === this.humanTeam) || (this.kind === 'online' && team === this.og?.myTeam));
+    const award = awardMatch(this.wallet, this.matchKey, won);
+    if (award) this.lastAward = award;
+  }
+
+  private shopItem(kind: ItemKind, id: string): void {
+    const item = findItem(kind, id);
+    if (!item) return;
+    const name = () => t(`${kind}.${id}.name` as MessageKey);
+    const res = buyOrEquip(this.wallet, kind, id);
+    if (res === 'too_poor') {
+      play('error');
+      this.showToast(() => t('shop.tooPoor'));
+      return;
+    }
+    play(res === 'bought' ? 'goal' : 'move');
+    this.showToast(() => t(res === 'bought' ? 'shop.bought' : 'shop.equippedToast', { name: name() }));
+  }
+
+  private awardHtml(): string {
+    const a = this.lastAward;
+    if (!a || this.kind === 'tutorial') return '';
+    const parts: string[] = [];
+    if (a.win) parts.push(t('ov.coinsWin', { n: a.win }));
+    if (a.bonus) parts.push(t('ov.coinsBonus', { n: a.bonus }));
+    const next = t('ov.coinsNext', { n: a.toNext });
+    return `<div class="award ${a.coins ? 'paid' : ''}">
+        ${a.coins ? `<p class="award-total">${coinIcon()}<strong dir="ltr">+${a.coins}</strong> <span>${esc(t('ov.coinsEarned'))}</span></p>` : ''}
+        <p class="small muted">${esc([...parts, next].join(' · '))}</p>
+      </div>`;
+  }
+
   private renderWinBody(team: Team | null): string {
     const g = this.game;
     let title = team ? t('ov.wins', { team: teamName(team) }) : t('ov.draw');
@@ -2119,11 +2188,12 @@ export class App {
         <button class="btn" data-act="leaderboard">${esc(t('act.leaderboard'))}</button>`;
     }
     return `
-      <p class="eyebrow"><span aria-hidden="true">${team ? '🏆' : '🤝'} </span>${esc(t('ov.fullTime'))}</p>
+      <p class="eyebrow">${esc(t('ov.fullTime'))}</p>
       <h2>${team ? `<span class="team-dot big ${team}"></span>` : ''}${esc(title)}</h2>
       <p class="bigscore" dir="ltr">${g.score.A} – ${g.score.B}</p>
       <p>${esc(t(reasonKey, { n: g.config.goalsToWin }))}</p>
       ${extra}
+      ${this.awardHtml()}
       <dl class="summary">
         <dt>${esc(t('ov.rallies'))}</dt><dd>${g.rally}</dd>
         <dt>${esc(t('ov.turns'))}</dt><dd>${kind === 'goals' || kind === 'golden' ? g.turnNumber : turnsPlayed(g)}</dd>
