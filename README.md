@@ -1,8 +1,10 @@
-# CHECKLINE
 <p align="center">
-  <img src="assets/gameplay.png" alt="Checkline gameplay screenshot" width="900">
+  <img src="assets/Logo.png" alt="Checkline logo" width="900">
 </p>
+
 <div align="center">
+
+# CHECKLINE
 
 ### ⚽ Football meets chess.
 
