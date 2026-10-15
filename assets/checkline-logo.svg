@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="430" viewBox="0 0 1440 430" role="img" aria-labelledby="title desc">
+<title id="title">Checkline — tactical football, chess-powered</title>
+<desc id="desc">A gold-edged emerald shield with a chess knight, football, pitch lines, and three action markers beside the Checkline wordmark.</desc>
+<defs>
+  <linearGradient id="shieldFill" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#123c2e"/>
+    <stop offset="0.52" stop-color="#09231c"/>
+    <stop offset="1" stop-color="#071312"/>
+  </linearGradient>
+  <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#ffe39a"/>
+    <stop offset="0.45" stop-color="#e9b850"/>
+    <stop offset="1" stop-color="#b87528"/>
+  </linearGradient>
+  <linearGradient id="knight" x1="0" y1="0" x2="0.9" y2="1">
+    <stop offset="0" stop-color="#fff9e9"/>
+    <stop offset="1" stop-color="#dfd6c3"/>
+  </linearGradient>
+  <linearGradient id="blue" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#16c7ee" stop-opacity="0"/>
+    <stop offset="1" stop-color="#16c7ee"/>
+  </linearGradient>
+  <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+    <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#020807" flood-opacity="0.55"/>
+  </filter>
+  <clipPath id="shieldClip">
+    <path d="M210 25 348 76v111c0 91-49 153-138 202C121 340 72 278 72 187V76z"/>
+  </clipPath>
+</defs>
+<g filter="url(#shadow)">
+  <path d="M210 17 357 71v116c0 99-55 165-147 216C118 352 63 286 63 187V71z" fill="#06100e" stroke="url(#gold)" stroke-width="7" stroke-linejoin="round"/>
+  <g clip-path="url(#shieldClip)">
+    <path d="M60 20h300v390H60z" fill="url(#shieldFill)"/>
+    <path d="M72 40h276v350H72z" fill="#128052" opacity="0.14"/>
+    <path d="M111 73h198v265H111z" fill="none" stroke="#dce9d8" stroke-opacity="0.35" stroke-width="3"/>
+    <path d="M111 205h198M148 73v42h124V73M168 73v19h84V73M148 338v-42h124v42M168 338v-19h84v19" fill="none" stroke="#dce9d8" stroke-opacity="0.28" stroke-width="3"/>
+    <circle cx="210" cy="205" r="34" fill="none" stroke="#dce9d8" stroke-opacity="0.28" stroke-width="3"/>
+    <path d="M111 129h198M111 161h198M111 249h198M111 281h198" stroke="#dce9d8" stroke-opacity="0.06" stroke-width="1"/>
+    <path d="M145 73v265M178 73v265M210 73v265M243 73v265M276 73v265" stroke="#dce9d8" stroke-opacity="0.045" stroke-width="1"/>
+    <path d="M84 234 107 227 91 254 110 249 82 286 92 260 73 264z" fill="#13c8ec" opacity="0.88"/>
+    <path d="M116 282c18-8 27-16 39-28" fill="none" stroke="url(#blue)" stroke-width="5" stroke-linecap="round"/>
+    <path d="M128 293c2-21 9-38 25-53l12-17v-25c-18-10-29-26-29-47 0-25 18-44 44-44l10-21 17 25 25-1 21 18 13 22-9 18-20 5-14-8-5 21c18 17 22 41 10 59l17 16 25 9v22z" fill="url(#knight)" stroke="#0b1713" stroke-width="5" stroke-linejoin="round"/>
+    <path d="m178 109 12-21 17 25 18-1-16 15-22-4z" fill="url(#gold)"/>
+    <path d="M224 130c6 3 11 7 15 12l-12 5-10-7z" fill="#e7bc62"/>
+    <circle cx="239" cy="143" r="3.5" fill="#14231d"/>
+    <path d="M134 295h153l-15 17H147z" fill="url(#gold)"/>
+    <rect x="132" y="312" width="157" height="9" rx="4.5" fill="url(#gold)"/>
+    <g fill="url(#gold)">
+      <circle cx="190" cy="342" r="5"/>
+      <circle cx="210" cy="342" r="5"/>
+      <circle cx="230" cy="342" r="5"/>
+    </g>
+    <g transform="translate(278 263)">
+      <circle r="25" fill="#fff9e9" stroke="#10251d" stroke-width="4"/>
+      <path d="m0-10 9 6-3 11h-12l-3-11z" fill="#10251d"/>
+      <path d="m0-10-4-13M9-4l14-4M6 7l9 12M-6 7l-10 12M-9-4l-14-4" fill="none" stroke="#10251d" stroke-width="3" stroke-linecap="round"/>
+    </g>
+  </g>
+  <path d="M210 17 357 71v116c0 99-55 165-147 216C118 352 63 286 63 187V71z" fill="none" stroke="url(#gold)" stroke-width="7" stroke-linejoin="round"/>
+  <path d="M210 31 345 81v106c0 87-47 146-135 194-88-48-135-107-135-194V81z" fill="none" stroke="#fff0c7" stroke-opacity="0.28" stroke-width="2"/>
+</g>
+<g transform="translate(0 0)">
+  <text x="468" y="206" fill="#f6f2e8" font-family="Arial, Helvetica, sans-serif" font-size="108" font-weight="900" letter-spacing="6">CHECK<tspan fill="#e9b850">LINE</tspan></text>
+  <path d="M474 237h87" stroke="url(#gold)" stroke-width="5" stroke-linecap="round"/>
+  <path d="M572 237h74" stroke="#18c7e6" stroke-width="5" stroke-linecap="round"/>
+  <text x="474" y="283" fill="#e9b850" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" letter-spacing="7">TACTICAL FOOTBALL</text>
+  <text x="474" y="326" fill="#b9c6bb" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="600" letter-spacing="5">CHESS-POWERED</text>
+  <circle cx="479" cy="369" r="4" fill="#17c5e8"/>
+  <circle cx="494" cy="369" r="4" fill="#e9b850"/>
+  <circle cx="509" cy="369" r="4" fill="#e9b850"/>
+  <text x="526" y="376" fill="#9eafa3" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="600" letter-spacing="3">ONE PITCH · THREE ACTIONS · ONE OPENING</text>
+</g>
+</svg>
