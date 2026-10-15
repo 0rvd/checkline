@@ -19,9 +19,35 @@
   const emit = (e) => authListeners.forEach((cb) => cb(e));
   const startSession = (u, email) => (session = { userId: u.id, email, isGuest: !email, displayName: u.name ?? null });
   const profiles = new Map([
-    ['opp', { id: 'opp', displayName: 'ليلى', rating: 1234, wins: 3, draws: 1, losses: 1, games: 5 }],
-    ['host2', { id: 'host2', displayName: 'Marco', rating: 1180, wins: 1, draws: 0, losses: 2, games: 3 }],
+    ['opp', { id: 'opp', displayName: 'ليلى', rating: 1234, wins: 3, draws: 1, losses: 1, games: 5, rankPoints: 320, isGuest: false }],
+    ['host2', { id: 'host2', displayName: 'Marco', rating: 1180, wins: 1, draws: 0, losses: 2, games: 3, rankPoints: 40, isGuest: false }],
   ]);
+  // C-rank tiers, same as public.rank_tiers in supabase/setup.sql.
+  const TIERS = [['C5', 0], ['C4', 150], ['C3', 300], ['C2', 450], ['C1', 600]];
+  const rankJson = (pts) => {
+    let i = 0;
+    while (i + 1 < TIERS.length && pts >= TIERS[i + 1][1]) i++;
+    return { tier: TIERS[i][0], rankPoints: pts, tierMin: TIERS[i][1], nextTierAt: TIERS[i + 1]?.[1] ?? null };
+  };
+  const profileJson = (p, own) => ({ ...p, ...rankJson(p.rankPoints ?? 0), ...(own ? { email: session?.email ?? null } : {}) });
+  // ---- wallets (mirrors public.cl_users and its functions in supabase/setup.sql)
+  const PRICES = { 'floor:classic': 0, 'floor:midnight': 10, 'floor:sunset': 15, 'floor:neon': 20, 'skin:classic': 0, 'skin:obsidian': 10, 'skin:neon': 15, 'skin:gold': 25 };
+  const wallets = new Map();
+  const paid = new Set();
+  const walletOf = (id) => {
+    if (!wallets.has(id)) wallets.set(id, { coins: 0, matches: 0, wins: 0, owned: ['floor:classic', 'skin:classic'], floor: 'classic', skin: 'classic' });
+    return wallets.get(id);
+  };
+  const wjson = (id) => { const w = walletOf(id); return { ...w, owned: [...w.owned], prices: { ...PRICES } }; };
+  // Online results only (scored with the result, like checkline_private.finalize_match).
+  const payMatch = (id, key, won, played) => {
+    if (paid.has(`${id}|${key}`)) return 0;
+    paid.add(`${id}|${key}`);
+    const w = walletOf(id);
+    const coins = played ? (won ? 3 : 0) + ((w.matches + 1) % 3 === 0 ? 5 : 0) : 0;
+    w.matches++; if (won) w.wins++; w.coins += coins;
+    return coins;
+  };
   const matches = new Map();
   const subs = new Map();
   const lobbySubs = new Set();
@@ -31,8 +57,8 @@
   const err = (code) => Object.assign(new Error(`CL:${code}`), { message: `CL:${code}` });
   const view = (m) => ({
     id: m.id, code: m.code, status: m.status, isPublic: m.isPublic,
-    playerA: { id: m.a, name: profiles.get(m.a).displayName, rating: profiles.get(m.a).rating },
-    playerB: m.b ? { id: m.b, name: profiles.get(m.b).displayName, rating: profiles.get(m.b).rating } : null,
+    playerA: { id: m.a, name: profiles.get(m.a).displayName, rating: profiles.get(m.a).rating, tier: rankJson(profiles.get(m.a).rankPoints ?? 0).tier },
+    playerB: m.b ? { id: m.b, name: profiles.get(m.b).displayName, rating: profiles.get(m.b).rating, tier: rankJson(profiles.get(m.b).rankPoints ?? 0).tier } : null,
     state: m.state, version: m.version, lastAction: m.lastAction ?? null, lastEvents: m.lastEvents ?? null, lastActor: m.lastActor ?? null,
     winnerId: m.winnerId ?? null, endReason: m.endReason ?? null, aSeenAt: m.aSeen, bSeenAt: m.bSeen,
     rulesVersion: m.rulesVersion ?? 3, turnStartedAt: m.turnStartedAt ?? null,
@@ -51,8 +77,23 @@
     const sA = winner === null ? 0.5 : winner === m.a ? 1 : 0;
     const expA = 1 / (1 + Math.pow(10, (B.rating - A.rating) / 400));
     const d = Math.round(32 * (sA - expA));
-    m.result = { winnerId: winner, reason, aRatingBefore: A.rating, aRatingAfter: A.rating + d, bRatingBefore: B.rating, bRatingAfter: B.rating - d };
+    const played = ['goals', 'clock', 'draw'].includes(reason) || (m.state?.turnNumber ?? 0) >= 6;
+    const ranked = !A.isGuest && !B.isGuest;
+    let da = 0, db = 0, note = ranked ? null : 'guest';
+    if (ranked && winner !== null) {
+      const gain = played ? 10 : 0;
+      if (!played) note = 'short_match';
+      if (winner === m.a) { da = gain; db = -6; } else { db = gain; da = -6; }
+    }
+    const aP = A.rankPoints ?? 0, bP = B.rankPoints ?? 0;
+    const aCoins = payMatch(m.a, `online-${m.id}`, winner === m.a, played);
+    const bCoins = payMatch(m.b, `online-${m.id}`, winner === m.b, played);
+    m.result = {
+      winnerId: winner, reason, aRatingBefore: A.rating, aRatingAfter: A.rating + d, bRatingBefore: B.rating, bRatingAfter: B.rating - d,
+      ranked, rankNote: note, aPointsBefore: aP, aPointsAfter: Math.max(0, aP + da), bPointsBefore: bP, bPointsAfter: Math.max(0, bP + db), aCoins, bCoins,
+    };
     A.rating += d; B.rating -= d; A.games++; B.games++;
+    A.rankPoints = Math.max(0, aP + da); B.rankPoints = Math.max(0, bP + db);
     if (winner === null) { A.draws++; B.draws++; } else if (winner === m.a) { A.wins++; B.losses++; } else { B.wins++; A.losses++; }
   };
   async function apply(m, actor, action) {
@@ -129,6 +170,15 @@
       if (u.password === password) throw authErr('same_password', 'New password should be different from the old password.');
       u.password = password;
     },
+    async changePassword(current, next) {
+      await delay(cfg.latency);
+      if (!session || session.isGuest) throw err('not_signed_in');
+      const u = users.get(session.email);
+      if (u.password !== current) throw Object.assign(new Error('CL:wrong_password'), {});
+      if (String(next).length < 6) throw authErr('weak_password', 'Password should be at least 6 characters.');
+      if (u.password === next) throw authErr('same_password', 'New password should be different from the old password.');
+      u.password = next;
+    },
     onAuthEvent(cb) { authListeners.add(cb); return () => authListeners.delete(cb); },
     async nameAvailable(name) {
       await delay(cfg.latency / 2);
@@ -141,12 +191,30 @@
       const n = String(name).trim();
       if (n.length < 2 || n.length > 24) throw err('invalid_name');
       if (!(await this.nameAvailable(n))) throw err('name_taken');
-      const p = profiles.get(ME()) ?? { id: ME(), rating: 1200, wins: 0, draws: 0, losses: 0, games: 0 };
+      const p = profiles.get(ME()) ?? { id: ME(), rating: 1200, wins: 0, draws: 0, losses: 0, games: 0, rankPoints: 0, isGuest: !!session.isGuest };
       p.displayName = n;
       profiles.set(ME(), p);
-      return { ...p };
+      return profileJson(p, true);
     },
-    async myProfile() { await delay(cfg.latency / 2); return session && profiles.get(ME()) ? { ...profiles.get(ME()) } : null; },
+    async getWallet() {
+      await delay(cfg.latency / 2);
+      if (!session) throw err('not_signed_in');
+      if (!profiles.get(ME())) throw err('profile_required');
+      return wjson(ME());
+    },
+    async buyItem(kind, id) {
+      await delay(cfg.latency / 2);
+      const item = `${kind}:${id}`;
+      if (!(item in PRICES)) throw err('unknown_item');
+      const w = walletOf(ME());
+      if (!w.owned.includes(item)) {
+        if (w.coins < PRICES[item]) throw err('too_poor');
+        w.coins -= PRICES[item]; w.owned.push(item);
+      }
+      w[kind] = id;
+      return wjson(ME());
+    },
+    async myProfile() { await delay(cfg.latency / 2); return session && profiles.get(ME()) ? profileJson(profiles.get(ME()), true) : null; },
     async createMatch(isPublic) {
       await delay(cfg.latency);
       const m = { id: 'm-' + Math.random().toString(36).slice(2, 8), code: 'K7M2QX', status: 'waiting', isPublic, a: ME(), b: null, state: null, version: 0, createdAt: iso(), aSeen: iso(), bSeen: null };
@@ -216,7 +284,7 @@
       if (cfg.lb === 'error') throw new Error('Failed to fetch');
       if (cfg.lb === 'empty') return { total: 0, rows: [], me: null };
       const names = ['ليلى', 'Marco', 'Aisha Al-Harbi', 'Tomás', 'Noor', 'Kenji', 'فهد', 'Priya', 'Ola', 'Sven', 'Mariam', 'Diego', 'سارة', 'Lena', 'Omar', 'Yuki', 'Ivan', 'Zara', 'Hamza', 'Elif', 'Chen', 'Rana'];
-      const all = names.map((n, i) => ({ rank: i + 1, id: i === 4 ? ME() : 'p' + i, displayName: n, rating: 1460 - i * 13, wins: 20 - i, draws: i % 3, losses: 3 + (i % 5), games: 23 - i + (i % 5) + (i % 3) }));
+      const all = names.map((n, i) => ({ rank: i + 1, id: i === 4 ? ME() : 'p' + i, displayName: n, rating: 1460 - i * 13, wins: 20 - i, draws: i % 3, losses: 3 + (i % 5), games: 23 - i + (i % 5) + (i % 3), ...(({ tier, rankPoints }) => ({ tier, rankPoints }))(rankJson(Math.max(0, 720 - i * 45))) }));
       return { total: all.length, rows: all.slice(offset, offset + limit), me: session ? all[4] : null };
     },
     subscribeMatch(id, h) {
@@ -230,6 +298,10 @@
 
   // Test controls for the simulated opponent.
   window.__fake = {
+    /** Test hook: the owner edits a wallet by hand in the Table Editor. */
+    setCoins(n) { walletOf(ME()).coins = n; },
+    setRank(points) { profiles.get(ME()).rankPoints = points; },
+    wallet() { return wjson(ME()); },
     matches,
     users,
     /** Simulate clicking the confirmation link in the sign-up email. */

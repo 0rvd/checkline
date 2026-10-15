@@ -107,7 +107,7 @@ describe('online configuration', () => {
     assert.equal(toOnlineError({ code: 'otp_expired', message: 'Email link is invalid or has expired' }).code, 'link_expired');
     assert.equal(toOnlineError({ message: 'Email address not authorized' }).code, 'email_not_authorized');
     for (const code of ['stale_state', 'illegal', 'network', 'anonymous_disabled', 'match_not_found', 'invalid_credentials', 'email_not_confirmed',
-      'email_taken', 'weak_password', 'invalid_email', 'password_mismatch', 'same_password', 'rate_limited', 'signup_disabled', 'email_disabled', 'link_expired', 'email_not_authorized', 'name_taken']) {
+      'email_taken', 'weak_password', 'invalid_email', 'password_mismatch', 'same_password', 'rate_limited', 'signup_disabled', 'email_disabled', 'link_expired', 'email_not_authorized', 'name_taken', 'too_poor', 'unknown_item', 'wrong_password']) {
       assert.ok((en as Record<string, string>)[`online.err.${code}`] && (ar as Record<string, string>)[`online.err.${code}`]);
     }
   });

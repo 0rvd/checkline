@@ -1,32 +1,34 @@
 -- =====================================================================================
--- Checkline online play: Supabase database setup  (rules v3 / app v0.3)
+-- Checkline: complete Supabase database setup  (rules v3 / app v0.4)
 -- =====================================================================================
--- What this creates (all names are prefixed so they cannot collide with your own tables):
---   public.cl_profiles        one row per player (display name, Elo rating, wins/draws/losses)
---   public.cl_matches         online matches and their authoritative game state
---   public.cl_match_moves     append-only move history per match
---   public.cl_match_results   one row per rated result (written exactly once per match)
---   checkline_private.*       server-side copy of the game rules + internal helpers (not exposed)
---   public.cl_* functions     the only way clients can change data (RPC via supabase-js)
+-- Run this whole file in Dashboard -> SQL Editor. It is safe to run again at any time.
 --
--- Prerequisites
---   1. A Supabase project (any plan). Run this whole file in Dashboard -> SQL Editor.
---   2. Authentication: players log in with email + password (the Email provider, on by default).
---      Optional: Sign In / Providers -> "Allow anonymous sign-ins" lets people also play as guests.
---      Profiles hold only a display name and the record; emails stay in Supabase Auth.
+-- Tables (public schema, all protected by row-level security):
+--   public."user"              one row per player: username, email (private), coins, equipped
+--                              skin and pitch floor, C-rank points, Elo rating and record
+--   public.rank_tiers          C5 ... C1 and the points each tier starts at
+--   public.cosmetics           the shop catalogue (pitch floors and piece skins, with prices)
+--   public.user_cosmetics      what each player owns (inventory)
+--   public.coin_transactions   every coin change: match rewards, purchases, admin grants/removals,
+--                              hand edits in the Table Editor (audit trail)
+--   public.cl_matches          online matches (the two participants, invite code, public-lobby
+--                              flag, status, authoritative game state, turn timer)
+--   public.cl_match_moves      every accepted action in a match
+--   public.cl_match_results    one row per finished match: score, Elo and C-rank changes, coins
+--   checkline_private.*        server copy of the game rules + internal helpers (not exposed)
+--   public.cl_* functions      the only way the game can change data (RPC)
 --
--- Safety
---   * Re-runnable: CREATE ... IF NOT EXISTS / CREATE OR REPLACE / ADD COLUMN IF NOT EXISTS.
---   * Never drops tables or data. DROP statements only remove this script's own RLS policies
---     and its own check constraint on cl_matches.end_reason, so they can be recreated.
---   * Upgrading from the v0.2 script: columns are added in place. Matches started under the
---     old rules are marked rules_version 2 and can no longer be played (players can resign).
---   * Clients get SELECT access through row-level security only. Every write goes through
---     SECURITY DEFINER functions that validate the caller, the turn, the match version and
---     the action itself (with the same rules as the game client, see src/rules/engine.ts).
+-- Passwords are never stored here: Supabase Auth keeps them (hashed). Emails are copied into
+-- public."user" for you to see, but only the player themself can read their own email.
 --
--- Keep in sync: the rule constants below mirror src/rules/config.ts. If you tune the game,
--- update both and run `npm run verify:sql` (needs local PostgreSQL) to check they agree.
+-- Upgrading: earlier versions are migrated in place, keeping every player, match and coin:
+--   cl_profiles  -> renamed to public."user" (same ids, ratings, records)
+--   cl_users / cl_wallets (coins + items) and the test table public.users -> copied into
+--   public."user", public.user_cosmetics and public.coin_transactions; the old tables are
+--   then moved to the private schema as checkline_private.legacy_* (or removed if empty).
+--
+-- Keep in sync: the rule constants mirror src/rules/config.ts, shop prices mirror
+-- src/ui/economy.ts. Check with `npm run verify:sql` (needs local PostgreSQL).
 --   board 8x12 | 3 AP, Surge +1 once per rally | pass 4, shot 5, shot cost 1 | goal mouth B-G,
 --   keeper box B-G x 2 rows | orthogonal marking | first to 3, regulation 30 turns, draw at 40
 -- =====================================================================================
@@ -37,46 +39,111 @@ create schema if not exists checkline_private;
 revoke all on schema checkline_private from public;
 
 -- -------------------------------------------------------------------------------------
--- 1. Tables (and in-place upgrades from v0.2)
+-- 1. Tables
 -- -------------------------------------------------------------------------------------
 
--- Player profile. Rating and record are only ever changed by checkline_private.finalize_match.
-create table if not exists public.cl_profiles (
-  id uuid primary key references auth.users (id) on delete cascade,
-  display_name text not null check (char_length(display_name) between 2 and 24),
-  rating integer not null default 1200,
+-- 1.1 Players. Upgrading from v0.3: the old cl_profiles table becomes public."user".
+do $$
+begin
+  if to_regclass('public."user"') is null and to_regclass('public.cl_profiles') is not null then
+    alter table public.cl_profiles rename to "user";
+    alter table public."user" rename column display_name to username;
+    alter index if exists public.cl_profiles_display_name_unique rename to user_username_unique;
+    alter index if exists public.cl_profiles_leaderboard_idx rename to user_leaderboard_idx;
+    raise notice 'Checkline: cl_profiles renamed to public."user" (all players kept).';
+  end if;
+end
+$$;
+
+create table if not exists public."user" (
+  id uuid primary key references auth.users (id) on delete cascade,   -- the Supabase Auth user id
+  username text not null check (char_length(username) between 2 and 24),
+  email text,                                                         -- copied from Auth; private
+  is_guest boolean not null default false,                            -- anonymous (guest) account
+  coins integer not null default 0 check (coins >= 0),
+  equipped_skin text not null default 'classic',
+  equipped_floor text not null default 'classic',
+  rank_points integer not null default 0 check (rank_points >= 0),    -- C-rank ladder (C5..C1)
+  rating integer not null default 1200,                               -- Elo (leaderboard order)
   wins integer not null default 0 check (wins >= 0),
   draws integer not null default 0 check (draws >= 0),
   losses integer not null default 0 check (losses >= 0),
   games integer not null default 0 check (games >= 0),
-  -- When the rating last changed; earlier wins a tie on the leaderboard.
-  rating_updated_at timestamptz not null default now(),
+  ranked_games integer not null default 0 check (ranked_games >= 0),
+  rating_updated_at timestamptz not null default now(),               -- earlier wins leaderboard ties
+  rank_updated_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-alter table public.cl_profiles add column if not exists draws integer not null default 0;
+-- Old triggers from earlier versions that pointed at tables replaced below.
+drop trigger if exists cl_on_profile_created on public."user";
+drop trigger if exists cl_on_profile_renamed on public."user";
+drop trigger if exists cl_on_auth_email_changed on auth.users;
+drop trigger if exists users_on_sign_up on auth.users;
+drop trigger if exists users_on_email_change on auth.users;
 
-create index if not exists cl_profiles_leaderboard_idx
-  on public.cl_profiles (rating desc, wins desc, losses asc, rating_updated_at asc, id asc)
-  where games > 0;
+-- Columns added after earlier versions.
+alter table public."user" add column if not exists draws integer not null default 0;
+alter table public."user" add column if not exists email text;
+alter table public."user" add column if not exists is_guest boolean not null default false;
+alter table public."user" add column if not exists coins integer not null default 0 check (coins >= 0);
+alter table public."user" add column if not exists equipped_skin text not null default 'classic';
+alter table public."user" add column if not exists equipped_floor text not null default 'classic';
+alter table public."user" add column if not exists rank_points integer not null default 0 check (rank_points >= 0);
+alter table public."user" add column if not exists ranked_games integer not null default 0 check (ranked_games >= 0);
+alter table public."user" add column if not exists rank_updated_at timestamptz;
+comment on table public."user" is
+  'Checkline players. Passwords live only in Supabase Auth. Change coins with public.cl_admin_adjust_coins (audited); hand edits of coins are audited too.';
+comment on column public."user".email is 'Copied from Authentication -> Users. Only the player can read it; never shown publicly.';
+comment on column public."user".rank_points is 'C-rank points. The tier (C5..C1) is always derived from this via public.rank_tiers.';
 
--- A match. `state` is the authoritative game state (same JSON shape as the client's MatchState
--- minus config). `version` increases by one for every accepted action (optimistic concurrency).
+-- Email and guest flag from Auth (kept in step by triggers further down).
+update public."user" u set email = a.email, is_guest = coalesce(a.is_anonymous, false)
+from auth.users a
+where a.id = u.id and (u.email is distinct from a.email or u.is_guest is distinct from coalesce(a.is_anonymous, false));
+
+-- Unique usernames, ignoring upper/lower case and outer spaces ("Ali" = " ALI "). Older
+-- duplicates: the oldest player keeps the name, later ones get " 2", " 3", ...
+with ranked as (
+  select id, username, row_number() over (partition by lower(btrim(username)) order by created_at, id) as n
+  from public."user"
+)
+update public."user" p set username = left(btrim(r.username), 21) || ' ' || r.n, updated_at = now()
+from ranked r where p.id = r.id and r.n > 1;
+create unique index if not exists user_username_unique on public."user" (lower(btrim(username)));
+create unique index if not exists user_email_unique on public."user" (lower(email)) where email is not null;
+create index if not exists user_leaderboard_idx
+  on public."user" (rating desc, wins desc, losses asc, rating_updated_at asc, id asc) where games > 0;
+
+-- 1.2 C-rank tiers. A player's tier is always looked up from their points, never stored.
+create table if not exists public.rank_tiers (
+  code text primary key check (code ~ '^C[1-9]$'),
+  min_points integer not null unique check (min_points >= 0),
+  sort smallint not null unique
+);
+insert into public.rank_tiers (code, min_points, sort) values
+  ('C5', 0, 1), ('C4', 150, 2), ('C3', 300, 3), ('C2', 450, 4), ('C1', 600, 5)
+on conflict (code) do update set min_points = excluded.min_points, sort = excluded.sort;
+comment on table public.rank_tiers is 'C5 0-149, C4 150-299, C3 300-449, C2 450-599, C1 600+ (a tier ends where the next begins).';
+
+-- 1.3 Matches. Participants: player_a (Ivory, the host) and player_b (Ebony, who joined).
+-- Invite / lobby: `code` is the private invite code; `is_public` lists it in the lobby.
+-- `state` is the authoritative game state; `version` increases with every accepted action.
 create table if not exists public.cl_matches (
   id uuid primary key default gen_random_uuid(),
   code text not null unique check (code ~ '^[A-Z2-9]{6}$'),
   is_public boolean not null default true,
   status text not null default 'waiting'
     check (status in ('waiting', 'active', 'finished', 'cancelled')),
-  player_a uuid not null references public.cl_profiles (id) on delete cascade,  -- Ivory (Team A)
-  player_b uuid references public.cl_profiles (id) on delete cascade,           -- Ebony (Team B)
+  player_a uuid not null references public."user" (id) on delete cascade,  -- Ivory (Team A)
+  player_b uuid references public."user" (id) on delete cascade,           -- Ebony (Team B)
   state jsonb,
   version integer not null default 0,
   rules_version integer not null default 3,
   last_action jsonb,
   last_events jsonb,
   last_actor uuid,
-  winner_id uuid references public.cl_profiles (id) on delete cascade,  -- null + finished = draw
+  winner_id uuid references public."user" (id) on delete cascade,  -- null + finished = draw
   end_reason text,
   a_seen_at timestamptz not null default now(),
   b_seen_at timestamptz,
@@ -96,16 +163,15 @@ alter table public.cl_matches add column if not exists turn_started_at timestamp
 alter table public.cl_matches drop constraint if exists cl_matches_end_reason_check;
 alter table public.cl_matches add constraint cl_matches_end_reason_check
   check (end_reason in ('goals', 'clock', 'draw', 'resign', 'forfeit'));
-
 create index if not exists cl_matches_lobby_idx on public.cl_matches (status, is_public, created_at desc);
 create index if not exists cl_matches_player_a_idx on public.cl_matches (player_a);
 create index if not exists cl_matches_player_b_idx on public.cl_matches (player_b);
 
--- Append-only log of accepted actions (seq = match version after the action).
+-- Every accepted action (seq = match version after the action).
 create table if not exists public.cl_match_moves (
   match_id uuid not null references public.cl_matches (id) on delete cascade,
   seq integer not null,
-  player_id uuid not null references public.cl_profiles (id) on delete cascade,
+  player_id uuid not null references public."user" (id) on delete cascade,
   team text not null check (team in ('A', 'B')),
   action jsonb not null,
   events jsonb not null,
@@ -113,12 +179,13 @@ create table if not exists public.cl_match_moves (
   primary key (match_id, seq)
 );
 
--- Rated result. The primary key on match_id guarantees a match is rated at most once.
+-- Final result. The primary key on match_id means a match is scored exactly once, so Elo,
+-- C-rank points and coins can never be applied twice (retries, reconnects, double clicks).
 create table if not exists public.cl_match_results (
   match_id uuid primary key references public.cl_matches (id) on delete cascade,
-  player_a uuid references public.cl_profiles (id) on delete cascade,
-  player_b uuid references public.cl_profiles (id) on delete cascade,
-  winner_id uuid references public.cl_profiles (id) on delete cascade,  -- null = draw
+  player_a uuid references public."user" (id) on delete cascade,
+  player_b uuid references public."user" (id) on delete cascade,
+  winner_id uuid references public."user" (id) on delete cascade,  -- null = draw
   reason text not null,
   a_rating_before integer,
   a_rating_after integer,
@@ -129,8 +196,8 @@ create table if not exists public.cl_match_results (
   created_at timestamptz not null default now()
 );
 -- Upgrades from v0.2 (which stored winner/loser columns only).
-alter table public.cl_match_results add column if not exists player_a uuid references public.cl_profiles (id) on delete cascade;
-alter table public.cl_match_results add column if not exists player_b uuid references public.cl_profiles (id) on delete cascade;
+alter table public.cl_match_results add column if not exists player_a uuid references public."user" (id) on delete cascade;
+alter table public.cl_match_results add column if not exists player_b uuid references public."user" (id) on delete cascade;
 alter table public.cl_match_results add column if not exists a_rating_before integer;
 alter table public.cl_match_results add column if not exists a_rating_after integer;
 alter table public.cl_match_results add column if not exists b_rating_before integer;
@@ -150,6 +217,60 @@ $$;
 alter table public.cl_match_results drop constraint if exists cl_match_results_reason_check;
 alter table public.cl_match_results add constraint cl_match_results_reason_check
   check (reason in ('goals', 'clock', 'draw', 'resign', 'forfeit'));
+-- v0.4: C-rank points and coins paid with the result.
+alter table public.cl_match_results add column if not exists ranked boolean not null default false;
+alter table public.cl_match_results add column if not exists a_points_before integer;
+alter table public.cl_match_results add column if not exists a_points_after integer;
+alter table public.cl_match_results add column if not exists b_points_before integer;
+alter table public.cl_match_results add column if not exists b_points_after integer;
+alter table public.cl_match_results add column if not exists a_coins integer not null default 0;
+alter table public.cl_match_results add column if not exists b_coins integer not null default 0;
+alter table public.cl_match_results add column if not exists rank_note text;
+create index if not exists cl_match_results_created_idx on public.cl_match_results (created_at desc);
+
+-- 1.4 Shop catalogue and inventory.
+create table if not exists public.cosmetics (
+  kind text not null check (kind in ('floor', 'skin')),
+  id text not null check (id ~ '^[a-z0-9_-]{2,24}$'),
+  price integer not null check (price >= 0),
+  sort smallint not null default 0,
+  active boolean not null default true,
+  primary key (kind, id)
+);
+-- Starting catalogue (prices match src/ui/economy.ts). Re-running keeps prices you changed.
+insert into public.cosmetics (kind, id, price, sort) values
+  ('floor', 'classic', 0, 0), ('floor', 'midnight', 10, 1), ('floor', 'sunset', 15, 2), ('floor', 'neon', 20, 3),
+  ('skin', 'classic', 0, 0), ('skin', 'obsidian', 10, 1), ('skin', 'neon', 15, 2), ('skin', 'gold', 25, 3)
+on conflict (kind, id) do nothing;
+
+create table if not exists public.user_cosmetics (
+  user_id uuid not null references public."user" (id) on delete cascade,
+  kind text not null,
+  item_id text not null,
+  source text not null default 'purchase' check (source in ('starter', 'purchase', 'admin', 'migration')),
+  price_paid integer not null default 0 check (price_paid >= 0),
+  acquired_at timestamptz not null default now(),
+  primary key (user_id, kind, item_id),
+  foreign key (kind, item_id) references public.cosmetics (kind, id) on update cascade
+);
+
+-- 1.5 Coin history. Every change to public."user".coins writes one row here.
+create table if not exists public.coin_transactions (
+  id bigint generated always as identity primary key,
+  user_id uuid not null references public."user" (id) on delete cascade,
+  amount integer not null,
+  balance_after integer not null check (balance_after >= 0),
+  kind text not null check (kind in ('match_reward', 'purchase', 'admin_grant', 'admin_remove', 'manual_edit', 'migration')),
+  match_id uuid references public.cl_matches (id) on delete set null,
+  item text,
+  note text,
+  actor text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists coin_transactions_user_idx on public.coin_transactions (user_id, created_at desc);
+-- A match pays each player at most once (second guard next to cl_match_results' primary key).
+create unique index if not exists coin_transactions_match_once
+  on public.coin_transactions (user_id, match_id) where kind = 'match_reward';
 
 -- -------------------------------------------------------------------------------------
 -- 2. Server-side game rules (mirror of src/rules/engine.ts, ruleset v3)
@@ -639,11 +760,30 @@ begin
 end
 $$;
 
-create or replace function checkline_private.profile_json(p_id uuid)
+-- The C-rank tier for a number of points, read from public.rank_tiers (never stored).
+create or replace function checkline_private.rank_json(p_points integer)
 returns jsonb language sql stable set search_path = '' as $$
-  select jsonb_build_object('id', p.id, 'displayName', p.display_name, 'rating', p.rating,
-                            'wins', p.wins, 'draws', p.draws, 'losses', p.losses, 'games', p.games)
-  from public.cl_profiles p where p.id = p_id
+  select jsonb_build_object(
+    'tier', t.code,
+    'rankPoints', greatest(coalesce(p_points, 0), 0),
+    'tierMin', t.min_points,
+    'nextTierAt', (select min(n.min_points) from public.rank_tiers n where n.min_points > t.min_points))
+  from public.rank_tiers t
+  where t.min_points <= greatest(coalesce(p_points, 0), 0)
+  order by t.min_points desc
+  limit 1
+$$;
+
+-- Public player card (no email, no coins). p_private adds the player's own email.
+drop function if exists checkline_private.profile_json(uuid);
+create or replace function checkline_private.profile_json(p_id uuid, p_private boolean default false)
+returns jsonb language sql stable set search_path = '' as $$
+  select jsonb_build_object('id', p.id, 'displayName', p.username, 'rating', p.rating,
+                            'wins', p.wins, 'draws', p.draws, 'losses', p.losses, 'games', p.games,
+                            'rankedGames', p.ranked_games, 'isGuest', p.is_guest)
+         || coalesce(checkline_private.rank_json(p.rank_points), '{}'::jsonb)
+         || case when p_private then jsonb_build_object('email', p.email) else '{}'::jsonb end
+  from public."user" p where p.id = p_id
 $$;
 
 -- The JSON shape every match RPC returns (consumed by src/online/backend.ts).
@@ -655,10 +795,12 @@ returns jsonb language sql stable set search_path = '' as $$
     'status', p_match.status,
     'isPublic', p_match.is_public,
     'rulesVersion', p_match.rules_version,
-    'playerA', (select jsonb_build_object('id', p.id, 'name', p.display_name, 'rating', p.rating)
-                from public.cl_profiles p where p.id = p_match.player_a),
-    'playerB', (select jsonb_build_object('id', p.id, 'name', p.display_name, 'rating', p.rating)
-                from public.cl_profiles p where p.id = p_match.player_b),
+    'playerA', (select jsonb_build_object('id', p.id, 'name', p.username, 'rating', p.rating,
+                                          'tier', checkline_private.rank_json(p.rank_points) ->> 'tier')
+                from public."user" p where p.id = p_match.player_a),
+    'playerB', (select jsonb_build_object('id', p.id, 'name', p.username, 'rating', p.rating,
+                                          'tier', checkline_private.rank_json(p.rank_points) ->> 'tier')
+                from public."user" p where p.id = p_match.player_b),
     'state', p_match.state,
     'version', p_match.version,
     'lastAction', p_match.last_action,
@@ -676,52 +818,141 @@ returns jsonb language sql stable set search_path = '' as $$
     'result', (select jsonb_build_object(
                  'winnerId', r.winner_id, 'reason', r.reason,
                  'aRatingBefore', r.a_rating_before, 'aRatingAfter', r.a_rating_after,
-                 'bRatingBefore', r.b_rating_before, 'bRatingAfter', r.b_rating_after)
+                 'bRatingBefore', r.b_rating_before, 'bRatingAfter', r.b_rating_after,
+                 'ranked', r.ranked, 'rankNote', r.rank_note,
+                 'aPointsBefore', r.a_points_before, 'aPointsAfter', r.a_points_after,
+                 'bPointsBefore', r.b_points_before, 'bPointsAfter', r.b_points_after,
+                 'aCoins', r.a_coins, 'bCoins', r.b_coins)
                from public.cl_match_results r where r.match_id = p_match.id))
 $$;
 
--- Record a finished match exactly once and update both players' Elo ratings.
--- Elo (K = 32): E_a = 1 / (1 + 10^((R_b - R_a) / 400)); S_a = 1 win, 0.5 draw, 0 loss;
--- change = round(32 * (S_a - E_a)); A gains `change`, B loses the same amount (zero-sum).
+-- Change a player's coins and write the matching coin_transactions row, atomically.
+-- Raises CL:too_poor instead of ever letting the balance go below zero.
+create or replace function checkline_private.change_coins(p_uid uuid, p_amount integer, p_kind text,
+  p_match uuid default null, p_item text default null, p_note text default null, p_actor text default 'server')
+returns integer language plpgsql security definer set search_path = '' as $$
+declare v_balance integer;
+begin
+  select coins into v_balance from public."user" where id = p_uid for update;
+  if not found then raise exception 'CL:profile_required'; end if;
+  if coalesce(p_amount, 0) = 0 then return v_balance; end if;
+  if v_balance + p_amount < 0 then raise exception 'CL:too_poor'; end if;
+  perform set_config('checkline.coin_ledger', 'on', true);   -- tells the audit trigger this change is logged here
+  update public."user" set coins = coins + p_amount where id = p_uid returning coins into v_balance;
+  perform set_config('checkline.coin_ledger', 'off', true);
+  insert into public.coin_transactions (user_id, amount, balance_after, kind, match_id, item, note, actor)
+  values (p_uid, p_amount, v_balance, p_kind, p_match, p_item, p_note, coalesce(p_actor, 'server'));
+  return v_balance;
+end
+$$;
+
+-- Score a finished match exactly once, in one transaction: result row, Elo, C-rank points,
+-- record and coins. The insert into cl_match_results (primary key match_id) is the gate:
+-- if the match was already scored, nothing else happens.
+--
+-- Elo (K = 32, unchanged from v0.3): E_a = 1 / (1 + 10^((R_b - R_a) / 400)); S = 1 / 0.5 / 0;
+--   change = round(32 * (S_a - E_a)); A gains `change`, B loses the same (zero-sum). Every
+--   finished online match, guests included. Elo orders the leaderboard.
+-- C-rank points (the visible C5..C1 ladder), only between two registered (non-guest) players:
+--   win +10, loss -6 (never below 0), draw 0. Anti-abuse:
+--   * the winner gains nothing if the match was over before turn 6 (resign / forfeit early),
+--     but the player who quit still loses 6 - so quitting never dodges a loss;
+--   * the winner gains nothing from the same opponent more than 3 times in 24 hours.
+-- Coins: +3 for a win, +5 on every 3rd finished online match, only for matches that were
+--   actually played (ended by goals / clock / draw, or reached turn 6).
 create or replace function checkline_private.finalize_match(p_match public.cl_matches)
 returns void language plpgsql security definer set search_path = '' as $$
 declare
-  v_a public.cl_profiles;
-  v_b public.cl_profiles;
+  v_a public."user";
+  v_b public."user";
   v_expected numeric;
   v_score numeric;
   v_change integer;
+  v_played boolean;
+  v_ranked boolean;
+  v_note text;
+  v_loser uuid;
+  v_gain integer;
+  v_a_delta integer := 0;
+  v_b_delta integer := 0;
+  v_a_coins integer := 0;
+  v_b_coins integer := 0;
 begin
   if p_match.status <> 'finished' or p_match.player_b is null or p_match.end_reason is null then return; end if;
-  perform 1 from public.cl_profiles where id in (p_match.player_a, p_match.player_b) order by id for update;
-  select * into v_a from public.cl_profiles where id = p_match.player_a;
-  select * into v_b from public.cl_profiles where id = p_match.player_b;
+  perform 1 from public."user" where id in (p_match.player_a, p_match.player_b) order by id for update;
+  select * into v_a from public."user" where id = p_match.player_a;
+  select * into v_b from public."user" where id = p_match.player_b;
+
+  -- Elo
   v_expected := 1 / (1 + power(10::numeric, (v_b.rating - v_a.rating)::numeric / 400));
   v_score := case when p_match.winner_id is null then 0.5 when p_match.winner_id = v_a.id then 1 else 0 end;
   v_change := round(32 * (v_score - v_expected));
 
+  -- Was the match really played?
+  v_played := p_match.end_reason in ('goals', 'clock', 'draw')
+              or coalesce((p_match.state ->> 'turnNumber')::integer, 0) >= 6;
+
+  -- C-rank points
+  v_ranked := not v_a.is_guest and not v_b.is_guest;
+  if not v_ranked then
+    v_note := 'guest';
+  elsif p_match.winner_id is not null then
+    v_loser := case when p_match.winner_id = v_a.id then v_b.id else v_a.id end;
+    if not v_played then
+      v_note := 'short_match';
+    elsif (select count(*) from public.cl_match_results r
+           where r.ranked and r.created_at > now() - interval '24 hours'
+             and r.winner_id = p_match.winner_id and v_loser in (r.player_a, r.player_b)
+             and case when r.player_a = p_match.winner_id then r.a_points_after - r.a_points_before
+                      else r.b_points_after - r.b_points_before end > 0) >= 3 then
+      v_note := 'repeat_opponent';
+    end if;
+    v_gain := case when v_note is null then 10 else 0 end;
+    if p_match.winner_id = v_a.id then v_a_delta := v_gain; v_b_delta := -6;
+    else v_b_delta := v_gain; v_a_delta := -6; end if;
+  end if;
+
+  -- Coins
+  if v_played then
+    v_a_coins := case when p_match.winner_id = v_a.id then 3 else 0 end + case when (v_a.games + 1) % 3 = 0 then 5 else 0 end;
+    v_b_coins := case when p_match.winner_id = v_b.id then 3 else 0 end + case when (v_b.games + 1) % 3 = 0 then 5 else 0 end;
+  end if;
+
   insert into public.cl_match_results (match_id, player_a, player_b, winner_id, reason,
-    a_rating_before, a_rating_after, b_rating_before, b_rating_after, score_a, score_b)
+    a_rating_before, a_rating_after, b_rating_before, b_rating_after, score_a, score_b,
+    ranked, rank_note, a_points_before, a_points_after, b_points_before, b_points_after, a_coins, b_coins)
   values (p_match.id, v_a.id, v_b.id, p_match.winner_id, p_match.end_reason,
     v_a.rating, v_a.rating + v_change, v_b.rating, v_b.rating - v_change,
-    coalesce((p_match.state -> 'score' ->> 'A')::integer, 0), coalesce((p_match.state -> 'score' ->> 'B')::integer, 0))
+    coalesce((p_match.state -> 'score' ->> 'A')::integer, 0), coalesce((p_match.state -> 'score' ->> 'B')::integer, 0),
+    v_ranked, v_note,
+    v_a.rank_points, greatest(v_a.rank_points + v_a_delta, 0), v_b.rank_points, greatest(v_b.rank_points + v_b_delta, 0),
+    v_a_coins, v_b_coins)
   on conflict (match_id) do nothing;
-  if not found then return; end if;  -- already rated
+  if not found then return; end if;  -- already scored
 
-  update public.cl_profiles set
+  update public."user" set
     rating = rating + v_change, games = games + 1,
     wins = wins + case when v_score = 1 then 1 else 0 end,
     draws = draws + case when v_score = 0.5 then 1 else 0 end,
     losses = losses + case when v_score = 0 then 1 else 0 end,
-    rating_updated_at = case when v_change <> 0 then now() else rating_updated_at end, updated_at = now()
+    rank_points = greatest(rank_points + v_a_delta, 0),
+    ranked_games = ranked_games + case when v_ranked then 1 else 0 end,
+    rank_updated_at = case when v_a_delta <> 0 then now() else rank_updated_at end,
+    rating_updated_at = case when v_change <> 0 then now() else rating_updated_at end
   where id = v_a.id;
-  update public.cl_profiles set
+  update public."user" set
     rating = rating - v_change, games = games + 1,
     wins = wins + case when v_score = 0 then 1 else 0 end,
     draws = draws + case when v_score = 0.5 then 1 else 0 end,
     losses = losses + case when v_score = 1 then 1 else 0 end,
-    rating_updated_at = case when v_change <> 0 then now() else rating_updated_at end, updated_at = now()
+    rank_points = greatest(rank_points + v_b_delta, 0),
+    ranked_games = ranked_games + case when v_ranked then 1 else 0 end,
+    rank_updated_at = case when v_b_delta <> 0 then now() else rank_updated_at end,
+    rating_updated_at = case when v_change <> 0 then now() else rating_updated_at end
   where id = v_b.id;
+
+  perform checkline_private.change_coins(v_a.id, v_a_coins, 'match_reward', p_match.id, null, 'Online match', 'server');
+  perform checkline_private.change_coins(v_b.id, v_b_coins, 'match_reward', p_match.id, null, 'Online match', 'server');
 end
 $$;
 
@@ -739,7 +970,7 @@ end
 $$;
 
 -- Apply a validated engine result to a locked match row: store state, log the move, keep the
--- turn timer and finish + rate the match when the engine says it is over.
+-- turn timer and finish + score the match when the engine says it is over.
 create or replace function checkline_private.commit_action(p_m public.cl_matches, p_actor uuid, p_team text, p_action jsonb, p_res jsonb, p_present boolean default true)
 returns public.cl_matches language plpgsql set search_path = '' as $$
 declare
@@ -774,10 +1005,33 @@ begin
 end
 $$;
 
+-- Coins, items and equipped cosmetics of one player, plus the live price list.
+create or replace function checkline_private.wallet_json(p_uid uuid)
+returns jsonb language sql stable set search_path = '' as $$
+  select jsonb_build_object(
+    'coins', u.coins, 'matches', u.games, 'wins', u.wins,
+    'floor', u.equipped_floor, 'skin', u.equipped_skin,
+    'owned', coalesce((select jsonb_agg(c.kind || ':' || c.item_id order by c.kind, c.item_id)
+                       from public.user_cosmetics c where c.user_id = u.id), '[]'::jsonb),
+    'prices', coalesce((select jsonb_object_agg(k.kind || ':' || k.id, k.price)
+                        from public.cosmetics k where k.active), '{}'::jsonb))
+  from public."user" u where u.id = p_uid
+$$;
+
 -- -------------------------------------------------------------------------------------
 -- 4. Client API (RPC). Errors are raised as 'CL:<code>' and translated by the client.
 -- -------------------------------------------------------------------------------------
 
+-- Is a username free? Used by the sign-up form before the account exists.
+create or replace function public.cl_name_available(p_name text)
+returns boolean language sql stable security definer set search_path = '' as $$
+  select not exists (
+    select 1 from public."user" p
+    where lower(btrim(p.username)) = lower(btrim(regexp_replace(coalesce(p_name, ''), '\s+', ' ', 'g')))
+      and p.id is distinct from auth.uid())
+$$;
+
+-- Create or rename your own player row. Only the username can be set by the player.
 create or replace function public.cl_upsert_profile(p_display_name text)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
@@ -787,15 +1041,21 @@ begin
   if char_length(v_name) < 2 or char_length(v_name) > 24 or v_name ~ '[[:cntrl:]]' then
     raise exception 'CL:invalid_name';
   end if;
-  insert into public.cl_profiles (id, display_name) values (v_uid, v_name)
-  on conflict (id) do update set display_name = excluded.display_name, updated_at = now();
-  return checkline_private.profile_json(v_uid);
+  begin
+    insert into public."user" (id, username, email, is_guest)
+    select a.id, v_name, a.email, coalesce(a.is_anonymous, false) from auth.users a where a.id = v_uid
+    on conflict (id) do update set username = excluded.username;
+  exception when unique_violation then
+    raise exception 'CL:name_taken';
+  end;
+  if not found then raise exception 'CL:not_signed_in'; end if;
+  return checkline_private.profile_json(v_uid, true);
 end
 $$;
 
 create or replace function public.cl_get_my_profile()
 returns jsonb language sql stable security definer set search_path = '' as $$
-  select checkline_private.profile_json(auth.uid())
+  select checkline_private.profile_json(auth.uid(), true)
 $$;
 
 -- Open a match. Public matches are listed in the lobby; private ones are joined by code only.
@@ -807,7 +1067,7 @@ declare
   v_m public.cl_matches;
   v_code text;
 begin
-  if not exists (select 1 from public.cl_profiles where id = v_uid) then raise exception 'CL:profile_required'; end if;
+  if not exists (select 1 from public."user" where id = v_uid) then raise exception 'CL:profile_required'; end if;
   select * into v_m from public.cl_matches
     where player_a = v_uid and status = 'waiting' order by created_at desc limit 1 for update;
   if found then
@@ -841,7 +1101,7 @@ declare
   v_m public.cl_matches;
   v_first text;
 begin
-  if not exists (select 1 from public.cl_profiles where id = v_uid) then raise exception 'CL:profile_required'; end if;
+  if not exists (select 1 from public."user" where id = v_uid) then raise exception 'CL:profile_required'; end if;
   select * into v_m from public.cl_matches where code = upper(btrim(coalesce(p_code, ''))) for update;
   if not found then raise exception 'CL:match_not_found'; end if;
   if v_m.player_a = v_uid or v_m.player_b = v_uid then
@@ -1018,14 +1278,15 @@ begin
 end
 $$;
 
--- Leaderboard page. Only players with at least one rated game are ranked.
+-- Leaderboard page (public: anyone can read it, but it only ever contains public fields -
+-- no email, no coins). Ranked by Elo as in v0.3; each row also shows the C-rank tier.
 -- Order (deterministic): rating desc, wins desc, losses asc, earliest to reach the rating, id.
 create or replace function public.cl_get_leaderboard(p_offset integer default 0, p_limit integer default 20)
-returns jsonb language sql stable security invoker set search_path = '' as $$
+returns jsonb language sql stable security definer set search_path = '' as $$
   with ranked as (
-    select p.id, p.display_name, p.rating, p.wins, p.draws, p.losses, p.games,
+    select p.id, p.username, p.rating, p.wins, p.draws, p.losses, p.games, p.rank_points,
            row_number() over (order by p.rating desc, p.wins desc, p.losses asc, p.rating_updated_at asc, p.id asc) as rank
-    from public.cl_profiles p
+    from public."user" p
     where p.games > 0
   ), page as (
     select * from ranked order by rank
@@ -1035,32 +1296,324 @@ returns jsonb language sql stable security invoker set search_path = '' as $$
   select jsonb_build_object(
     'total', (select count(*) from ranked),
     'rows', coalesce((select jsonb_agg(jsonb_build_object(
-               'rank', rank, 'id', id, 'displayName', display_name, 'rating', rating,
-               'wins', wins, 'draws', draws, 'losses', losses, 'games', games) order by rank) from page), '[]'::jsonb),
-    'me', (select jsonb_build_object('rank', rank, 'id', id, 'displayName', display_name, 'rating', rating,
-                                     'wins', wins, 'draws', draws, 'losses', losses, 'games', games)
+               'rank', rank, 'id', id, 'displayName', username, 'rating', rating,
+               'wins', wins, 'draws', draws, 'losses', losses, 'games', games,
+               'tier', checkline_private.rank_json(rank_points) ->> 'tier', 'rankPoints', rank_points) order by rank) from page), '[]'::jsonb),
+    'me', (select jsonb_build_object('rank', rank, 'id', id, 'displayName', username, 'rating', rating,
+                                     'wins', wins, 'draws', draws, 'losses', losses, 'games', games,
+                                     'tier', checkline_private.rank_json(rank_points) ->> 'tier', 'rankPoints', rank_points)
            from ranked where id = auth.uid()))
 $$;
 
+-- Your coins, items and equipped cosmetics.
+create or replace function public.cl_get_wallet()
+returns jsonb language plpgsql stable security definer set search_path = '' as $$
+declare v_uid uuid := checkline_private.require_uid();
+begin
+  if not exists (select 1 from public."user" where id = v_uid) then raise exception 'CL:profile_required'; end if;
+  return checkline_private.wallet_json(v_uid);
+end
+$$;
+
+-- Buy (if not owned yet) and equip a floor or skin. One transaction: the price is read from
+-- public.cosmetics, coins are taken with a ledger row, the item is added and equipped.
+-- Not enough coins -> CL:too_poor and nothing changes.
+create or replace function public.cl_buy_item(p_kind text, p_id text)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_uid uuid := checkline_private.require_uid();
+  v_item public.cosmetics;
+  v_owned boolean;
+begin
+  if not exists (select 1 from public."user" where id = v_uid) then raise exception 'CL:profile_required'; end if;
+  perform 1 from public."user" where id = v_uid for update;
+  select * into v_item from public.cosmetics where kind = p_kind and id = p_id;
+  if not found then raise exception 'CL:unknown_item'; end if;
+  v_owned := exists (select 1 from public.user_cosmetics where user_id = v_uid and kind = p_kind and item_id = p_id);
+  if not v_owned then
+    if not v_item.active then raise exception 'CL:unknown_item'; end if;
+    perform checkline_private.change_coins(v_uid, -v_item.price, 'purchase', null, p_kind || ':' || p_id, null, 'player');
+    insert into public.user_cosmetics (user_id, kind, item_id, source, price_paid)
+    values (v_uid, p_kind, p_id, 'purchase', v_item.price);
+  end if;
+  update public."user" set
+    equipped_floor = case when p_kind = 'floor' then p_id else equipped_floor end,
+    equipped_skin = case when p_kind = 'skin' then p_id else equipped_skin end
+  where id = v_uid;
+  return checkline_private.wallet_json(v_uid);
+end
+$$;
+
+-- ADMIN ONLY: give or take coins, with a required note. Recorded in public.coin_transactions.
+-- Callable from the SQL Editor or a server holding the service-role key; players cannot call it.
+--   select public.cl_admin_adjust_coins('ORVD', 100, 'Tournament prize');
+--   select public.cl_admin_adjust_coins('player@example.com', -20, 'Refund reversal');
+-- p_player may be a username, an email or a user id. Taking more than the player has is refused.
+create or replace function public.cl_admin_adjust_coins(p_player text, p_amount integer, p_note text)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_user public."user";
+  v_balance integer;
+  v_key text := btrim(coalesce(p_player, ''));
+begin
+  if coalesce(p_amount, 0) = 0 then raise exception 'CL:bad_amount'; end if;
+  if char_length(btrim(coalesce(p_note, ''))) < 3 then raise exception 'CL:note_required'; end if;
+  select * into v_user from public."user" u
+  where u.id::text = v_key or lower(btrim(u.username)) = lower(v_key) or lower(u.email) = lower(v_key)
+  limit 1;
+  if not found then raise exception 'CL:player_not_found'; end if;
+  v_balance := checkline_private.change_coins(v_user.id, p_amount,
+    case when p_amount > 0 then 'admin_grant' else 'admin_remove' end, null, null, btrim(p_note),
+    coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), session_user::text));
+  return jsonb_build_object('player', v_user.username, 'amount', p_amount, 'coins', v_balance);
+end
+$$;
+
 -- -------------------------------------------------------------------------------------
--- 5. Row-level security and privileges
+-- 5. Triggers: player rows follow Supabase Auth; inventory, equipped items and coin audit
 -- -------------------------------------------------------------------------------------
 
-alter table public.cl_profiles enable row level security;
+-- Sign-up: create the player row from the username typed on the sign-up form. If it is
+-- missing, invalid or taken, no row is made and the game asks for a name on first login -
+-- sign-up itself never fails because of this. Guests choose their name in the game.
+create or replace function checkline_private.handle_new_user()
+returns trigger language plpgsql security definer set search_path = '' as $$
+declare
+  v_name text := btrim(regexp_replace(coalesce(new.raw_user_meta_data ->> 'display_name', ''), '\s+', ' ', 'g'));
+begin
+  if char_length(v_name) between 2 and 24 and v_name !~ '[[:cntrl:]]' then
+    begin
+      insert into public."user" (id, username, email, is_guest)
+      values (new.id, v_name, new.email, coalesce(new.is_anonymous, false))
+      on conflict do nothing;
+    exception when others then
+      null;  -- never block a sign-up
+    end;
+  end if;
+  return new;
+end
+$$;
+drop trigger if exists cl_on_auth_user_created on auth.users;
+create trigger cl_on_auth_user_created after insert on auth.users
+  for each row execute function checkline_private.handle_new_user();
+
+-- Email changed (or a guest upgraded to an email account) in Auth -> update the player row.
+create or replace function checkline_private.sync_auth_user()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  update public."user" set email = new.email, is_guest = coalesce(new.is_anonymous, false)
+  where id = new.id and (email is distinct from new.email or is_guest is distinct from coalesce(new.is_anonymous, false));
+  return new;
+end
+$$;
+drop trigger if exists cl_on_auth_user_updated on auth.users;
+create trigger cl_on_auth_user_updated after update of email, is_anonymous on auth.users
+  for each row execute function checkline_private.sync_auth_user();
+
+-- New player -> owns the free Classic floor and skin.
+create or replace function checkline_private.give_starter_items()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  insert into public.user_cosmetics (user_id, kind, item_id, source)
+  select new.id, c.kind, c.id, 'starter' from public.cosmetics c where c.price = 0 and c.id = 'classic'
+  on conflict do nothing;
+  return new;
+end
+$$;
+drop trigger if exists user_starter_items on public."user";
+create trigger user_starter_items after insert on public."user"
+  for each row execute function checkline_private.give_starter_items();
+
+-- Equipped floor / skin must be owned (Classic is always allowed). Also stamps updated_at.
+create or replace function checkline_private.check_user_row()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  if new.equipped_floor <> 'classic' and not exists (
+       select 1 from public.user_cosmetics c where c.user_id = new.id and c.kind = 'floor' and c.item_id = new.equipped_floor) then
+    raise exception 'CL:not_owned' using detail = 'Give the player that floor in public.user_cosmetics first.';
+  end if;
+  if new.equipped_skin <> 'classic' and not exists (
+       select 1 from public.user_cosmetics c where c.user_id = new.id and c.kind = 'skin' and c.item_id = new.equipped_skin) then
+    raise exception 'CL:not_owned' using detail = 'Give the player that skin in public.user_cosmetics first.';
+  end if;
+  new.updated_at := now();
+  return new;
+end
+$$;
+drop trigger if exists user_check_row on public."user";
+create trigger user_check_row before insert or update on public."user"
+  for each row execute function checkline_private.check_user_row();
+
+-- Coins edited directly (e.g. in Table Editor) instead of through change_coins: keep the
+-- audit trail complete by logging the difference as a 'manual_edit'.
+create or replace function checkline_private.audit_coin_edit()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  if new.coins is distinct from old.coins
+     and coalesce(current_setting('checkline.coin_ledger', true), 'off') <> 'on' then
+    insert into public.coin_transactions (user_id, amount, balance_after, kind, note, actor)
+    values (new.id, new.coins - old.coins, new.coins, 'manual_edit', 'Edited directly in the database',
+            coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), session_user::text));
+  end if;
+  return new;
+end
+$$;
+drop trigger if exists user_audit_coins on public."user";
+create trigger user_audit_coins after update of coins on public."user"
+  for each row execute function checkline_private.audit_coin_edit();
+
+-- Every existing player owns the Classic items.
+insert into public.user_cosmetics (user_id, kind, item_id, source)
+select u.id, c.kind, c.id, 'starter' from public."user" u cross join public.cosmetics c
+where c.id = 'classic'
+on conflict do nothing;
+
+-- -------------------------------------------------------------------------------------
+-- 6. Upgrades: move coins and items from earlier tables (never lost), retire old objects
+-- -------------------------------------------------------------------------------------
+
+-- Old triggers and functions that pointed at the earlier tables.
+drop trigger if exists cl_on_result_pay on public.cl_match_results;
+drop function if exists public.cl_report_match(text, boolean);   -- client-reported results are no longer paid
+
+create or replace function checkline_private.migrate_wallet(p_uid uuid, p_coins integer, p_owned text[],
+  p_floor text, p_skin text, p_from text)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not exists (select 1 from public."user" where id = p_uid) then return; end if;
+  insert into public.user_cosmetics (user_id, kind, item_id, source)
+  select p_uid, c.kind, c.id, 'migration'
+  from unnest(coalesce(p_owned, '{}'::text[])) o
+  join public.cosmetics c on c.kind || ':' || c.id = o
+  on conflict do nothing;
+  if coalesce(p_coins, 0) > 0 then
+    perform checkline_private.change_coins(p_uid, p_coins, 'migration', null, null, 'Moved from ' || p_from, 'setup.sql');
+  end if;
+  update public."user" set
+    equipped_floor = case when exists (select 1 from public.user_cosmetics c where c.user_id = p_uid and c.kind = 'floor' and c.item_id = p_floor) then p_floor else equipped_floor end,
+    equipped_skin = case when exists (select 1 from public.user_cosmetics c where c.user_id = p_uid and c.kind = 'skin' and c.item_id = p_skin) then p_skin else equipped_skin end
+  where id = p_uid;
+end
+$$;
+
+-- An old public table whose data has been copied: removed if empty, otherwise kept as a
+-- private backup (checkline_private.legacy_<name>) that the API cannot reach.
+create or replace function checkline_private.retire_table(p_name text)
+returns void language plpgsql security definer set search_path = '' as $$
+declare
+  v_rows bigint;
+  v_new text := 'legacy_' || p_name;
+begin
+  execute format('select count(*) from public.%I', p_name) into v_rows;
+  if v_rows = 0 then
+    execute format('drop table public.%I', p_name);
+    raise notice 'Checkline: removed empty table public.%', p_name;
+  else
+    if to_regclass('checkline_private.' || v_new) is not null then
+      v_new := v_new || '_' || to_char(now(), 'YYYYMMDDHH24MISS');
+    end if;
+    execute format('alter table public.%I set schema checkline_private', p_name);
+    execute format('alter table checkline_private.%I rename to %I', p_name, v_new);
+    raise notice 'Checkline: % rows copied; old table kept as checkline_private.%', v_rows, v_new;
+  end if;
+end
+$$;
+
+do $$
+declare
+  v_src text;
+  r record;
+  v_name text;
+begin
+  -- v0.3 coins tables (cl_wallets from 003_wallets.sql, cl_users from 004_users_table.sql).
+  foreach v_src in array array['cl_wallets', 'cl_users'] loop
+    if to_regclass('public.' || v_src) is not null then
+      execute format('drop trigger if exists cl_users_before_update on public.%I', v_src);
+      execute format('drop trigger if exists cl_users_after_rename on public.%I', v_src);
+      for r in execute format(
+        'select w.user_id, w.coins, w.owned, w.floor, w.skin from public.%I w', v_src) loop
+        perform checkline_private.migrate_wallet(r.user_id, r.coins, r.owned, r.floor, r.skin, v_src);
+      end loop;
+      perform checkline_private.retire_table(v_src);
+    end if;
+  end loop;
+
+  -- The step-by-step test table public.users (id, username, email, coins, skins, pitch_colors ...).
+  if to_regclass('public.users') is not null and exists (
+       select 1 from information_schema.columns
+       where table_schema = 'public' and table_name = 'users' and column_name = 'pitch_colors') then
+    execute 'drop trigger if exists users_touch on public.users';
+    for r in execute 'select id, username, coins, skins, skin, pitch_colors, pitch_color from public.users' loop
+      if not exists (select 1 from public."user" where id = r.id) and exists (select 1 from auth.users where id = r.id) then
+        v_name := left(btrim(r.username), 24);
+        if char_length(v_name) < 2 or exists (select 1 from public."user" where lower(btrim(username)) = lower(v_name)) then
+          v_name := 'player-' || left(replace(r.id::text, '-', ''), 6);
+        end if;
+        insert into public."user" (id, username, email, is_guest)
+        select a.id, v_name, a.email, coalesce(a.is_anonymous, false) from auth.users a where a.id = r.id;
+      end if;
+      perform checkline_private.migrate_wallet(r.id, r.coins,
+        array(select 'skin:' || s from unnest(r.skins) s) || array(select 'floor:' || f from unnest(r.pitch_colors) f),
+        r.pitch_color, r.skin, 'users');
+    end loop;
+    perform checkline_private.retire_table('users');
+  end if;
+end
+$$;
+
+drop function if exists checkline_private.pay_online_result();
+drop function if exists checkline_private.pay_match(uuid, text, boolean);
+drop function if exists checkline_private.create_wallet();
+drop function if exists checkline_private.profile_renamed();
+drop function if exists checkline_private.auth_email_changed();
+drop function if exists checkline_private.users_before_update();
+drop function if exists checkline_private.users_renamed();
+drop function if exists checkline_private.shop_price(text, text);
+drop function if exists checkline_private.on_sign_up();
+drop function if exists checkline_private.on_email_change();
+drop function if exists checkline_private.touch_updated_at();
+
+-- -------------------------------------------------------------------------------------
+-- 7. Row-level security and privileges
+-- -------------------------------------------------------------------------------------
+
+alter table public."user" enable row level security;
+alter table public.rank_tiers enable row level security;
+alter table public.cosmetics enable row level security;
+alter table public.user_cosmetics enable row level security;
+alter table public.coin_transactions enable row level security;
 alter table public.cl_matches enable row level security;
 alter table public.cl_match_moves enable row level security;
 alter table public.cl_match_results enable row level security;
 
--- Tables are read-only for clients; all writes go through the functions above.
-revoke all on table public.cl_profiles, public.cl_matches, public.cl_match_moves, public.cl_match_results
+-- Tables are read-only for players; every change goes through the functions above.
+revoke all on table public."user", public.rank_tiers, public.cosmetics, public.user_cosmetics,
+  public.coin_transactions, public.cl_matches, public.cl_match_moves, public.cl_match_results
   from public, anon, authenticated;
-grant select on table public.cl_profiles to anon, authenticated;
-grant select on table public.cl_matches, public.cl_match_moves, public.cl_match_results to authenticated;
+grant select on table public.rank_tiers, public.cosmetics to anon, authenticated;
+grant select on table public."user", public.user_cosmetics, public.coin_transactions,
+  public.cl_matches, public.cl_match_moves, public.cl_match_results to authenticated;
 
--- Profiles (display name, rating, record) are public: they make up the leaderboard.
-drop policy if exists "cl_profiles_read_all" on public.cl_profiles;
-create policy "cl_profiles_read_all" on public.cl_profiles
-  for select to anon, authenticated using (true);
+-- Players: only your own row (it has your email and coins). Public player info (name, rating,
+-- tier, record) is served by cl_get_leaderboard and the match functions instead.
+drop policy if exists "cl_profiles_read_all" on public."user";
+drop policy if exists "user_read_own" on public."user";
+create policy "user_read_own" on public."user"
+  for select to authenticated using ((select auth.uid()) = id);
+
+drop policy if exists "rank_tiers_read_all" on public.rank_tiers;
+create policy "rank_tiers_read_all" on public.rank_tiers for select to anon, authenticated using (true);
+
+drop policy if exists "cosmetics_read_all" on public.cosmetics;
+create policy "cosmetics_read_all" on public.cosmetics for select to anon, authenticated using (true);
+
+drop policy if exists "user_cosmetics_read_own" on public.user_cosmetics;
+create policy "user_cosmetics_read_own" on public.user_cosmetics
+  for select to authenticated using ((select auth.uid()) = user_id);
+
+drop policy if exists "coin_transactions_read_own" on public.coin_transactions;
+create policy "coin_transactions_read_own" on public.coin_transactions
+  for select to authenticated using ((select auth.uid()) = user_id);
 
 -- Matches: participants see their own; signed-in players also see public matches waiting for an opponent.
 drop policy if exists "cl_matches_read_participant_or_open" on public.cl_matches;
@@ -1083,38 +1636,37 @@ create policy "cl_match_results_read_participant" on public.cl_match_results
 revoke all on all functions in schema checkline_private from public, anon, authenticated;
 
 -- Public RPCs: signed-in players only (email accounts and guests both have the `authenticated` role).
-revoke all on function public.cl_upsert_profile(text) from public, anon;
-revoke all on function public.cl_get_my_profile() from public, anon;
-revoke all on function public.cl_create_match(boolean) from public, anon;
-revoke all on function public.cl_join_match(text) from public, anon;
-revoke all on function public.cl_get_match(uuid) from public, anon;
-revoke all on function public.cl_list_open_matches() from public, anon;
-revoke all on function public.cl_list_my_matches() from public, anon;
-revoke all on function public.cl_submit_action(uuid, integer, jsonb) from public, anon;
-revoke all on function public.cl_claim_timeout(uuid) from public, anon;
-revoke all on function public.cl_touch_match(uuid) from public, anon;
-revoke all on function public.cl_resign(uuid) from public, anon;
-revoke all on function public.cl_claim_forfeit(uuid) from public, anon;
-revoke all on function public.cl_cancel_match(uuid) from public, anon;
+do $$
+declare v_fn text;
+begin
+  foreach v_fn in array array[
+    'public.cl_upsert_profile(text)', 'public.cl_get_my_profile()', 'public.cl_create_match(boolean)',
+    'public.cl_join_match(text)', 'public.cl_get_match(uuid)', 'public.cl_list_open_matches()',
+    'public.cl_list_my_matches()', 'public.cl_submit_action(uuid, integer, jsonb)', 'public.cl_claim_timeout(uuid)',
+    'public.cl_touch_match(uuid)', 'public.cl_resign(uuid)', 'public.cl_claim_forfeit(uuid)',
+    'public.cl_cancel_match(uuid)', 'public.cl_get_wallet()', 'public.cl_buy_item(text, text)'] loop
+    execute format('revoke all on function %s from public, anon', v_fn);
+    execute format('grant execute on function %s to authenticated', v_fn);
+  end loop;
+end
+$$;
 revoke all on function public.cl_get_leaderboard(integer, integer) from public;
-
-grant execute on function public.cl_upsert_profile(text) to authenticated;
-grant execute on function public.cl_get_my_profile() to authenticated;
-grant execute on function public.cl_create_match(boolean) to authenticated;
-grant execute on function public.cl_join_match(text) to authenticated;
-grant execute on function public.cl_get_match(uuid) to authenticated;
-grant execute on function public.cl_list_open_matches() to authenticated;
-grant execute on function public.cl_list_my_matches() to authenticated;
-grant execute on function public.cl_submit_action(uuid, integer, jsonb) to authenticated;
-grant execute on function public.cl_claim_timeout(uuid) to authenticated;
-grant execute on function public.cl_touch_match(uuid) to authenticated;
-grant execute on function public.cl_resign(uuid) to authenticated;
-grant execute on function public.cl_claim_forfeit(uuid) to authenticated;
-grant execute on function public.cl_cancel_match(uuid) to authenticated;
 grant execute on function public.cl_get_leaderboard(integer, integer) to anon, authenticated;
+revoke all on function public.cl_name_available(text) from public;
+grant execute on function public.cl_name_available(text) to anon, authenticated;
+
+-- Admin coins: nobody but the database owner (SQL Editor) and the service role.
+revoke all on function public.cl_admin_adjust_coins(text, integer, text) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.cl_admin_adjust_coins(text, integer, text) to service_role;
+  end if;
+end
+$$;
 
 -- -------------------------------------------------------------------------------------
--- 6. Realtime: stream match row changes to subscribed players (RLS applies to each subscriber).
+-- 8. Realtime: stream match row changes to subscribed players (RLS applies to each subscriber).
 -- -------------------------------------------------------------------------------------
 do $$
 begin
@@ -1125,82 +1677,5 @@ begin
   end if;
 end
 $$;
-
--- -------------------------------------------------------------------------------------
--- 7. Unique display names + profile on sign-up (also in supabase/migrations/002_unique_names.sql)
--- -------------------------------------------------------------------------------------
-
--- 1. Existing duplicate names (ignoring upper/lower case and outer spaces): the oldest
---    profile keeps the name; later ones get " 2", " 3", ... so the unique rule can apply.
-with ranked as (
-  select id, display_name,
-         row_number() over (partition by lower(btrim(display_name)) order by created_at, id) as n
-  from public.cl_profiles
-)
-update public.cl_profiles p
-   set display_name = left(btrim(r.display_name), 21) || ' ' || r.n, updated_at = now()
-  from ranked r
- where p.id = r.id and r.n > 1;
-
--- 2. The rule itself: no two players may share a display name ("Ali" = "ali" = " ALI ").
-create unique index if not exists cl_profiles_display_name_unique
-  on public.cl_profiles (lower(btrim(display_name)));
-
--- 3. Is a name free? Used by the sign-up form before the account is created.
-create or replace function public.cl_name_available(p_name text)
-returns boolean language sql stable security definer set search_path = '' as $$
-  select not exists (
-    select 1 from public.cl_profiles p
-    where lower(btrim(p.display_name)) = lower(btrim(regexp_replace(coalesce(p_name, ''), '\s+', ' ', 'g')))
-      and p.id is distinct from auth.uid())
-$$;
-revoke all on function public.cl_name_available(text) from public;
-grant execute on function public.cl_name_available(text) to anon, authenticated;
-
--- 4. Create / rename a profile; a taken name is refused with CL:name_taken.
-create or replace function public.cl_upsert_profile(p_display_name text)
-returns jsonb language plpgsql security definer set search_path = '' as $$
-declare
-  v_uid uuid := checkline_private.require_uid();
-  v_name text := btrim(regexp_replace(coalesce(p_display_name, ''), '\s+', ' ', 'g'));
-begin
-  if char_length(v_name) < 2 or char_length(v_name) > 24 or v_name ~ '[[:cntrl:]]' then
-    raise exception 'CL:invalid_name';
-  end if;
-  begin
-    insert into public.cl_profiles (id, display_name) values (v_uid, v_name)
-    on conflict (id) do update set display_name = excluded.display_name, updated_at = now();
-  exception when unique_violation then
-    raise exception 'CL:name_taken';
-  end;
-  return checkline_private.profile_json(v_uid);
-end
-$$;
-
--- 5. When someone signs up, create their player profile straight away from the name they
---    chose. If the name is missing, invalid or taken, no profile is made and the game asks
---    for a name on first login - sign-up itself never fails because of this.
-create or replace function checkline_private.handle_new_user()
-returns trigger language plpgsql security definer set search_path = '' as $$
-declare
-  v_name text := btrim(regexp_replace(coalesce(new.raw_user_meta_data ->> 'display_name', ''), '\s+', ' ', 'g'));
-begin
-  if char_length(v_name) between 2 and 24 and v_name !~ '[[:cntrl:]]' then
-    begin
-      insert into public.cl_profiles (id, display_name) values (new.id, v_name)
-      on conflict do nothing;
-    exception when others then
-      null;  -- never block a sign-up
-    end;
-  end if;
-  return new;
-end
-$$;
-revoke all on function checkline_private.handle_new_user() from public, anon, authenticated;
-
-drop trigger if exists cl_on_auth_user_created on auth.users;
-create trigger cl_on_auth_user_created
-  after insert on auth.users
-  for each row execute function checkline_private.handle_new_user();
 
 commit;

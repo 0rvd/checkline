@@ -19,6 +19,8 @@ const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const R = await import(join(root, 'build/src/rules/index.js'));
 const { toWire } = await import(join(root, 'build/src/online/wire.js'));
 const { planTurn, legalActions } = await import(join(root, 'build/src/ai/ai.js'));
+const { RANK_TIERS } = await import(join(root, 'build/src/online/ranks.js'));
+const { SHOP_ITEMS } = await import(join(root, 'build/src/ui/economy.js'));
 
 // ------------------------------------------------------------------ local postgres
 function pgBin() {
@@ -206,7 +208,8 @@ lap('parity compared');
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
 const U3 = '33333333-3333-4333-8333-333333333333';
-sql(`insert into auth.users (id) values ('${U1}'), ('${U2}'), ('${U3}');`);
+// U1 and U2 have email accounts; U3 is a guest (anonymous sign-in).
+sql(`insert into auth.users (id, email, is_anonymous) values ('${U1}', 'alice@example.com', false), ('${U2}', 'bob@example.com', false), ('${U3}', null, true);`);
 const rpc = (as, call) => {
   const r = sql(`select ${call};`, as);
   return { ...r, json: r.ok && r.out ? JSON.parse(r.out) : null };
@@ -227,11 +230,26 @@ check('profile created', rpc(U1, "public.cl_upsert_profile('Alice')").json?.disp
 rpc(U2, "public.cl_upsert_profile('Bob')");
 rpc(U3, "public.cl_upsert_profile('سارة')");
 check('Arabic display names stored', rpc(U3, 'public.cl_get_my_profile()').json?.displayName === 'سارة');
+// Unique names (case- and space-insensitive) and the sign-up trigger
+check('taken name refused', errOf(rpc(U2, "public.cl_upsert_profile(' alice ')")) === 'CL:name_taken');
+check('name availability for visitors', sql("select public.cl_name_available('ALICE');", 'anon').out === 'f' && sql("select public.cl_name_available('Zed');", 'anon').out === 't');
+check('own name counts as available when renaming', sql("select public.cl_name_available('alice');", U1).out === 't');
+const U4 = '44444444-4444-4444-8444-444444444444';
+const U5 = '55555555-5555-4555-8555-555555555555';
+sql(`insert into auth.users (id, raw_user_meta_data) values ('${U4}', '{"display_name":"  Dana  "}'), ('${U5}', '{"display_name":"dana"}');`);
+check('sign-up creates the profile from the chosen name', rpc(U4, 'public.cl_get_my_profile()').json?.displayName === 'Dana');
+check('sign-up with a taken name still succeeds, without a profile', sql(`select count(*) from auth.users where id = '${U5}';`).out === '1' && !rpc(U5, 'public.cl_get_my_profile()').json);
 
 // Direct table writes are blocked
 for (const [label, stmt] of [
-  ['insert profile', `insert into public.cl_profiles (id, display_name) values ('${U3}', 'x');`],
-  ['edit own rating', `update public.cl_profiles set rating = 3000 where id = '${U1}';`],
+  ['insert profile', `insert into public."user" (id, username) values ('${U3}', 'xx');`],
+  ['edit own rating', `update public."user" set rating = 3000 where id = '${U1}';`],
+  ['edit own coins', `update public."user" set coins = 3000 where id = '${U1}';`],
+  ['edit own rank points', `update public."user" set rank_points = 3000 where id = '${U1}';`],
+  ['give self an item', `insert into public.user_cosmetics (user_id, kind, item_id) values ('${U1}', 'skin', 'gold');`],
+  ['write coin history', `insert into public.coin_transactions (user_id, amount, balance_after, kind, actor) values ('${U1}', 5, 5, 'admin_grant', 'me');`],
+  ['change prices', `update public.cosmetics set price = 0;`],
+  ['change rank tiers', `update public.rank_tiers set min_points = 0;`],
   ['insert match', `insert into public.cl_matches (code, player_a) values ('ABCDEF', '${U1}');`],
   ['insert result', `insert into public.cl_match_results (match_id, winner_id, reason, score_a, score_b) values (gen_random_uuid(), '${U1}', 'goals', 3, 0);`],
   ['call private rules', `select checkline_private.initial_state('A');`],
@@ -309,6 +327,13 @@ sql(`select checkline_private.finalize_match(m) from public.cl_matches m where i
 const pw = rpc(winner, 'public.cl_get_my_profile()').json;
 const pl = rpc(loser, 'public.cl_get_my_profile()').json;
 check('re-finalizing does not double count', pw.rating === 1216 && pw.wins === 1 && pl.rating === 1184 && pl.losses === 1 && pw.games === 1);
+check('full match between two accounts is ranked: winner +10, loser 0 (floor)', view.result?.ranked === true && view.result?.rankNote === null &&
+  (winner === U1 ? view.result.aPointsAfter : view.result.bPointsAfter) === 10 && (winner === U1 ? view.result.bPointsAfter : view.result.aPointsAfter) === 0 &&
+  pw.rankPoints === 10 && pw.tier === 'C5' && pl.rankPoints === 0);
+check('full match pays the winner +3 coins with the result', (winner === U1 ? view.result.aCoins : view.result.bCoins) === 3 && (winner === U1 ? view.result.bCoins : view.result.aCoins) === 0 &&
+  sql(`select coins from public."user" where id = '${winner}';`).out === '3' &&
+  sql(`select count(*) from public.coin_transactions where match_id = '${created.id}' and kind = 'match_reward';`).out === '1');
+check('re-finalizing pays nothing twice', sql(`select coins || '|' || rank_points from public."user" where id = '${winner}';`).out === '3|10');
 check('outsider cannot read moves or results', sql(`select (select count(*) from public.cl_match_moves where match_id = '${created.id}') + (select count(*) from public.cl_match_results where match_id = '${created.id}');`, U3).out === '0');
 check('participant can read own result', sql(`select count(*) from public.cl_match_results where match_id = '${created.id}';`, winner).out === '1');
 
@@ -380,9 +405,95 @@ check('leaderboard pagination', page2.rows.length === 1 && page2.rows[0].rank ==
 check('leaderboard limit is capped', rpc('anon', 'public.cl_get_leaderboard(0, 5000)').ok);
 check('leaderboard includes my rank when signed in', rpc(U3, 'public.cl_get_leaderboard(0, 1)').json?.me?.id === U3);
 // Ties: equal rating and record -> earlier rating_updated_at, then id.
-sql(`update public.cl_profiles set rating = 1300, wins = 1, losses = 0, rating_updated_at = '2026-01-01' where id in ('${U1}', '${U2}');`);
+sql(`update public."user" set rating = 1300, wins = 1, losses = 0, rating_updated_at = '2026-01-01' where id in ('${U1}', '${U2}');`);
 const tie = rpc('anon', 'public.cl_get_leaderboard(0, 2)').json;
 check('ties broken deterministically by id', tie.rows[0].id === U1 && tie.rows[1].id === U2);
+
+
+// ------------------------------------------------------------------ C-ranks
+check('rank tiers in SQL match src/online/ranks.ts', sql("select string_agg(code || ':' || min_points, ',' order by sort) from public.rank_tiers;").out === RANK_TIERS.map((t) => `${t.tier}:${t.min}`).join(','));
+check('shop prices in SQL match src/ui/economy.ts', sql("select string_agg(kind || ':' || id || ':' || price, ',' order by kind, id) from public.cosmetics;").out ===
+  [...SHOP_ITEMS].sort((a, b) => (a.kind + ':' + a.id < b.kind + ':' + b.id ? -1 : 1)).map((i) => `${i.kind}:${i.id}:${i.price}`).join(','));
+const tierOf = (pts) => sql(`select checkline_private.rank_json(${pts}) ->> 'tier';`).out;
+check('rank tiers: C5 0-149, C4 150-299, C3 300-449, C2 450-599, C1 600+',
+  [[0, 'C5'], [149, 'C5'], [150, 'C4'], [299, 'C4'], [300, 'C3'], [449, 'C3'], [450, 'C2'], [599, 'C2'], [600, 'C1'], [5000, 'C1']].every(([p, t]) => tierOf(p) === t));
+check('rank shows progress to the next tier', (() => { const j = JSON.parse(sql(`select checkline_private.rank_json(160);`).out); return j.tierMin === 150 && j.nextTierAt === 300; })());
+check('tier follows points edited by the owner', sql(`update public."user" set rank_points = 455 where id = '${U2}';`).ok && rpc(U2, 'public.cl_get_my_profile()').json?.tier === 'C2');
+check('guest games are unranked (no points)', ff?.result?.ranked === false && ff?.result?.rankNote === 'guest' && ff?.result?.aPointsAfter === ff?.result?.aPointsBefore);
+// Ranked short match: the quitter still loses 6, the winner gains nothing.
+const playMatch = (host, guest, turnNumber, quitter) => {
+  const m = rpc(host, 'public.cl_create_match(false)').json;
+  rpc(guest, `public.cl_join_match(${q(m.code)})`);
+  if (turnNumber) sql(`update public.cl_matches set state = jsonb_set(state, '{turnNumber}', '${turnNumber}') where id = '${m.id}';`);
+  return rpc(quitter, `public.cl_resign('${m.id}')`).json;
+};
+const u1Before = rpc(U1, 'public.cl_get_my_profile()').json.rankPoints;
+const short = playMatch(U1, U2, 0, U2);
+check('early resign: loser -6, winner +0, no coins', short?.result?.ranked === true && short?.result?.rankNote === 'short_match' &&
+  short.result.bPointsAfter === 449 && short.result.aPointsAfter === u1Before && short.result.aCoins === 0 && short.result.bCoins === 0);
+check('the player who resigned drops a tier (C2 -> C3)', rpc(U2, 'public.cl_get_my_profile()').json?.tier === 'C3');
+// Same opponent: points for at most 3 wins in 24 hours.
+const priorWins = Number(sql(`select count(*) from public.cl_match_results where ranked and winner_id = '${U1}' and (a_points_after > a_points_before or b_points_after > b_points_before);`).out);
+const gains = [];
+for (let i = priorWins; i < 4; i++) {
+  const r = playMatch(U1, U2, 10, U2);
+  gains.push(r?.result?.aPointsAfter - r?.result?.aPointsBefore);
+}
+check('repeat opponent: no points after 3 wins in 24h, losses still count', gains.slice(0, -1).every((g) => g === 10) && gains[gains.length - 1] === 0 &&
+  sql(`select rank_note from public.cl_match_results where winner_id = '${U1}' order by created_at desc limit 1;`).out === 'repeat_opponent', JSON.stringify(gains));
+check('every 3rd played match pays +5', sql(`select count(*) from public.coin_transactions t join public.cl_match_results r on r.match_id = t.match_id
+  where t.kind = 'match_reward' and t.amount in (5, 8);`).out !== '0');
+
+// ------------------------------------------------------------------ coins, shop and inventory
+const W = (u) => rpc(u, 'public.cl_get_wallet()').json;
+const ledgerOk = () => sql(`select count(*) from public."user" u where u.coins <> coalesce((select sum(amount) from public.coin_transactions t where t.user_id = u.id), 0);`).out === '0';
+check('coin history adds up to every balance', ledgerOk());
+check('client-reported results are not paid (no cl_report_match)', !rpc(U3, "public.cl_report_match('ai-abc123', true)").ok);
+check('wallet has the price list from public.cosmetics', W(U3)?.prices?.['skin:gold'] === 25 && W(U3)?.owned?.includes('skin:classic'));
+const admin = (who, n, note) => sql(`select public.cl_admin_adjust_coins('${who}', ${n}, '${note}');`);
+check('admin grant by username', JSON.parse(admin('sara', 0, 'x').out || 'null') === null && JSON.parse(admin('سارة', 20, 'Welcome gift').out).coins === W(U3).coins);
+check('admin grant by email', JSON.parse(admin('ALICE@example.com', 5, 'Bug bounty').out)?.player === 'Alice');
+check('admin needs a note and a non-zero amount', /note_required/.test(admin('Alice', 5, '').err) && /bad_amount/.test(admin('Alice', 0, 'xyz').err));
+check('admin cannot take more than the player has', /too_poor/.test(admin('Alice', -100000, 'Oops').err) && Number(sql(`select coins from public."user" where id = '${U1}';`).out) >= 0);
+check('admin removal is recorded', JSON.parse(admin('Alice', -5, 'Correction').out)?.amount === -5 &&
+  sql(`select count(*) from public.coin_transactions where user_id = '${U1}' and kind in ('admin_grant', 'admin_remove');`).out === '2');
+check('players cannot call the admin coin function', !rpc(U1, "public.cl_admin_adjust_coins('Alice', 1000, 'free')").ok && !rpc('anon', "public.cl_admin_adjust_coins('Alice', 1000, 'free')").ok);
+const c3 = W(U3).coins;
+check('hand edit in the Table Editor is audited', sql(`update public."user" set coins = coins + 7 where id = '${U3}';`).ok &&
+  sql(`select amount || '|' || kind from public.coin_transactions where user_id = '${U3}' order by id desc limit 1;`).out === '7|manual_edit' && W(U3).coins === c3 + 7);
+check('coin history still adds up', ledgerOk());
+sql(`update public."user" set coins = 15 where id = '${U3}';`);
+check('unknown item refused', errOf(rpc(U3, "public.cl_buy_item('skin', 'rainbow')")) === 'CL:unknown_item');
+check('too expensive refused, nothing changes', errOf(rpc(U3, "public.cl_buy_item('skin', 'gold')")) === 'CL:too_poor' && W(U3)?.coins === 15 && !W(U3).owned.includes('skin:gold'));
+const bought = rpc(U3, "public.cl_buy_item('floor', 'sunset')").json;
+check('buy deducts, records, adds and equips in one step', bought?.coins === 0 && bought?.floor === 'sunset' && bought?.owned?.includes('floor:sunset') &&
+  sql(`select amount || '|' || item from public.coin_transactions where user_id = '${U3}' and kind = 'purchase';`).out === '-15|floor:sunset' &&
+  sql(`select price_paid from public.user_cosmetics where user_id = '${U3}' and item_id = 'sunset';`).out === '15');
+check('owned items equip for free', rpc(U3, "public.cl_buy_item('floor', 'classic')").json?.floor === 'classic' && rpc(U3, "public.cl_buy_item('floor', 'sunset')").json?.coins === 0);
+sql(`update public.cosmetics set active = false where kind = 'floor' and id = 'sunset';`);
+check('retired items stay usable for owners but cannot be bought', rpc(U3, "public.cl_buy_item('floor', 'sunset')").ok && errOf(rpc(U1, "public.cl_buy_item('floor', 'sunset')")) === 'CL:unknown_item');
+sql(`update public.cosmetics set active = true where kind = 'floor' and id = 'sunset';`);
+check('price changes in public.cosmetics apply to purchases', sql(`update public.cosmetics set price = 1 where kind = 'skin' and id = 'neon';`).ok && rpc(U1, "public.cl_buy_item('skin', 'neon')").ok &&
+  sql(`select amount from public.coin_transactions where user_id = '${U1}' and item = 'skin:neon';`).out === '-1');
+check('equipping an unowned item by hand is refused', /not_owned/.test(sql(`update public."user" set equipped_skin = 'gold' where id = '${U3}';`).err));
+
+// ------------------------------------------------------------------ privacy and Auth sync
+check('players read only their own row', sql('select count(*) from public."user";', U3).out === '1' && sql('select count(*) from public.coin_transactions;', U3).out === sql(`select count(*) from public.coin_transactions where user_id = '${U3}';`).out);
+check('visitors cannot read players', /permission denied/.test(sql('select count(*) from public."user";', 'anon').err));
+const lbAll = rpc('anon', 'public.cl_get_leaderboard(0, 50)');
+check('leaderboard shows tiers but never emails or coins', lbAll.ok && !/@|"coins"|"email"/.test(lbAll.out) && lbAll.json.rows.every((r) => /^C[1-5]$/.test(r.tier)));
+const anyMatch = rpc(U1, `public.cl_get_match('${created.id}')`);
+check('match data never includes emails', anyMatch.ok && !/@/.test(anyMatch.out) && /^C[1-5]$/.test(anyMatch.json.playerA.tier));
+check('own profile includes own email', rpc(U1, 'public.cl_get_my_profile()').json?.email === 'alice@example.com');
+const U6 = '66666666-6666-4666-8666-666666666666';
+sql(`insert into auth.users (id, email, is_anonymous, raw_user_meta_data) values ('${U6}', 'eve@example.com', false, '{"display_name":"Eve"}');`);
+check('sign-up creates the player row with email and Classic items', sql(`select username || '|' || email || '|' || is_guest from public."user" where id = '${U6}';`).out === 'Eve|eve@example.com|false' &&
+  sql(`select count(*) from public.user_cosmetics where user_id = '${U6}' and item_id = 'classic';`).out === '2');
+check('email changed in Authentication updates the player row', sql(`update auth.users set email = 'eve2@example.com' where id = '${U6}';`).ok && sql(`select email from public."user" where id = '${U6}';`).out === 'eve2@example.com');
+check('guest upgraded to an email account becomes ranked-eligible', sql(`update auth.users set is_anonymous = false, email = 'sara@example.com' where id = '${U3}';`).ok && sql(`select is_guest from public."user" where id = '${U3}';`).out === 'f');
+check('deleting the account deletes the player and their data', sql(`delete from auth.users where id = '${U6}';`).ok && sql(`select count(*) from public."user" where id = '${U6}';`).out === '0');
+check('no password column anywhere in public tables', sql(`select count(*) from information_schema.columns where table_schema = 'public' and column_name ilike '%pass%';`).out === '0');
+check('every exposed table has row-level security', sql(`select count(*) from pg_tables where schemaname = 'public' and not rowsecurity;`).out === '0');
 
 // ------------------------------------------------------------------ report
 console.log(`SQL rules parity: ${cases.length} actions (${accepted} accepted, ${goals} goals, ${cases.length - accepted} rejections compared)`);

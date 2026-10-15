@@ -469,9 +469,35 @@ for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 
   await page.click('[data-form="login"] button[type="submit"]');
   await page.waitForSelector('.profile-card');
   check('password reset works and the new password logs in', true);
+  // C-rank on the profile card.
+  const card = await page.textContent('.profile-card');
+  check('profile card shows the C-rank, points and the way to the next tier', /C5/.test(card) && /0\s*rank points/.test(card) && /150 to C4/.test(card) && !!(await page.$('.profile-card .rank-bar')));
+  // Change password while signed in (current password checked first).
+  await page.click('[data-act="online-change-pw"]');
+  await page.waitForSelector('[data-form="change-password"]');
+  await page.fill('#pw-current', 'not-it');
+  await page.fill('#pw-new', 'brandnew1');
+  await page.fill('#pw-new2', 'brandnew1');
+  await page.click('[data-form="change-password"] button[type="submit"]');
+  await page.waitForSelector('[data-form="change-password"] .form-error');
+  check('change password: wrong current password refused', /current password is not right/.test(await page.textContent('[data-form="change-password"] .form-error')));
+  await page.fill('#pw-current', 'newsecret');
+  await page.fill('#pw-new', 'brandnew1');
+  await page.fill('#pw-new2', 'brandnew2');
+  await page.click('[data-form="change-password"] button[type="submit"]');
+  await page.waitForTimeout(150);
+  check('change password: confirmation must match', /don't match/.test(await page.textContent('[data-form="change-password"] .form-error')));
+  await page.screenshot({ path: join(SHOTS, 'en-change-password.png') });
+  await page.fill('#pw-current', 'newsecret');
+  await page.fill('#pw-new', 'brandnew1');
+  await page.fill('#pw-new2', 'brandnew1');
+  await page.click('[data-form="change-password"] button[type="submit"]');
+  await page.waitForSelector('[data-form="change-password"]', { state: 'detached' });
+  check('change password: saved in Auth and the form closes', (await page.evaluate(() => window.__fake.users.get('mo@example.com').password)) === 'brandnew1');
   await page.waitForSelector('.match-row');
   await page.screenshot({ path: join(SHOTS, 'en-online-lobby.png') });
   check('online: lobby lists open matches', /Marco/.test(await page.textContent('.lobby')));
+  check('online: open matches show the host C-rank', (await page.textContent('.match-row .tier-chip').catch(() => '')) === 'C5');
   await page.click('[data-act="online-create"][data-public="0"]');
   await page.waitForSelector('#invite-code');
   check('online: private match shows invite code', (await page.textContent('#invite-code')).trim() === 'K7M2QX');
@@ -536,6 +562,8 @@ for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 
   await page.waitForSelector('.overlay .rating-change', { timeout: 5000 });
   const res = await page.textContent('.overlay');
   check('online: forfeit win shows result and rating change', /You win/.test(res) && /left the match/.test(res) && /\+\d+/.test(res));
+  check('online: an early forfeit win gives no rank points and says why', /No rank points for the win: the match ended before turn 6/.test(res) && !!(await page.$('.overlay .rank-change')));
+  check('online: the opponent who left still loses 6 rank points', (await page.evaluate(() => { const m = window.__fake.current(); return m.result.bPointsAfter - m.result.bPointsBefore; })) === -6);
   await page.screenshot({ path: join(SHOTS, 'en-online-result.png') });
   // Back to lobby, join an open match, resign.
   await page.click('.overlay [data-act="online-lobby"]');
@@ -622,6 +650,21 @@ for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 
   await page.click('[data-act="menu"]');
   await page.waitForSelector('.account-chip.in');
   check('menu shows the signed-in player', /Sara/.test(await page.textContent('.account-chip')));
+  // Signed in: coins and items come from the database wallet (the owner can edit them by hand).
+  await page.waitForTimeout(400);
+  check('wallet: signed-in menu shows the database balance', (await page.textContent('.coin-chip')).trim() === '0');
+  await page.evaluate(() => window.__fake.setCoins(25));
+  await page.click('.mode-card.shop-card');
+  await page.waitForSelector('.shop-grid');
+  await page.waitForTimeout(400);
+  check('wallet: coins edited in the database show up in the shop', /25/.test(await page.textContent('.wallet-balance')) && !!(await page.$('.cloud-tag')));
+  await page.click('[data-act="shop-item"][data-kind="skin"][data-id="neon"]');
+  await page.waitForTimeout(400);
+  const cw = await page.evaluate(() => window.__fake.wallet());
+  check('wallet: buying spends database coins and equips', cw.coins === 10 && cw.skin === 'neon' && (await page.evaluate(() => document.documentElement.dataset.skin)) === 'neon', JSON.stringify(cw));
+  check('wallet: signed-in shop says online matches pay the account', /Online matches pay coins to your account/.test(await page.textContent('.wallet-earn')));
+  check('wallet: this browser\'s own coins are untouched', (await page.evaluate(() => JSON.parse(localStorage.getItem('checkline.wallet.v1') || '{"coins":0}').coins)) === 0);
+  await page.click('[data-act="menu"]');
   await page.waitForTimeout(600);
   await page.screenshot({ path: join(SHOTS, 'en-menu-signed-in.png') });
   check('no console errors (accounts)', page.errors.length === 0, page.errors.join(' | '));
@@ -642,7 +685,8 @@ for (const [mode, lang] of [['ok', 'en'], ['ok', 'ar'], ['empty', 'en'], ['error
     await page.waitForSelector('table.lb tbody tr:not(.skeleton)');
     const rows = await page.$$eval('table.lb tbody tr', (r) => r.length);
     check(`leaderboard ${lang}: first page`, rows === 15);
-    check(`leaderboard ${lang}: rank, name, rating, W, D, L columns`, (await page.$$eval('table.lb thead th', (r) => r.length)) === 6);
+    check(`leaderboard ${lang}: position, name, C-rank, rating, W, D, L columns`, (await page.$$eval('table.lb thead th', (r) => r.length)) === 7);
+    check(`leaderboard ${lang}: C-ranks shown (C1 at the top here)`, (await page.$$eval('table.lb tbody .tier-cell .tier-chip', (r) => r.map((e) => e.textContent))).slice(0, 3).join() === 'C1,C1,C1');
     await page.click('[data-act="lb-next"]');
     await page.waitForFunction(() => document.querySelector('table.lb tbody tr td')?.textContent === '16');
     check(`leaderboard ${lang}: second page`, (await page.$$eval('table.lb tbody tr', (r) => r.length)) === 7);

@@ -4,21 +4,33 @@
 import type { Action, GameEvent, Team } from '../rules/types.js';
 import type { OnlineConfig } from './config.js';
 import type { WireState } from './wire.js';
+import type { Tier } from './ranks.js';
 
+/** A player's row in public."user" as the game sees it (email only for yourself). */
 export interface OnlineProfile {
   id: string;
   displayName: string;
+  /** Elo (orders the leaderboard). */
   rating: number;
   wins: number;
   draws: number;
   losses: number;
   games: number;
+  /** C-rank ladder, derived on the server from rankPoints. */
+  tier?: Tier;
+  rankPoints?: number;
+  tierMin?: number;
+  nextTierAt?: number | null;
+  rankedGames?: number;
+  isGuest?: boolean;
+  email?: string | null;
 }
 
 export interface MatchPlayer {
   id: string;
   name: string;
   rating: number;
+  tier?: Tier;
 }
 
 export type MatchStatus = 'waiting' | 'active' | 'finished' | 'cancelled';
@@ -33,6 +45,17 @@ export interface MatchResult {
   aRatingAfter: number;
   bRatingBefore: number;
   bRatingAfter: number;
+  /** C-rank points: only between two registered players. */
+  ranked?: boolean;
+  /** Why the winner gained no points: 'guest' | 'short_match' | 'repeat_opponent' (null = normal). */
+  rankNote?: string | null;
+  aPointsBefore?: number | null;
+  aPointsAfter?: number | null;
+  bPointsBefore?: number | null;
+  bPointsAfter?: number | null;
+  /** Coins paid to each side with the result. */
+  aCoins?: number;
+  bCoins?: number;
 }
 
 export interface OnlineMatch {
@@ -68,6 +91,8 @@ export interface LeaderboardRow {
   draws: number;
   losses: number;
   games: number;
+  tier?: Tier;
+  rankPoints?: number;
 }
 
 export interface LeaderboardPage {
@@ -83,6 +108,18 @@ export interface AuthSession {
   isGuest: boolean;
   /** Display name chosen at sign-up (stored with the account until the profile exists). */
   displayName: string | null;
+}
+
+/** Coins and cosmetics of a signed-in player (public."user" + public.user_cosmetics). */
+export interface ServerWallet {
+  coins: number;
+  matches: number;
+  wins: number;
+  owned: string[];
+  floor: string;
+  skin: string;
+  /** Live prices from public.cosmetics ("skin:gold" -> 25). */
+  prices?: Record<string, number>;
 }
 
 /** Auth changes the UI reacts to (e.g. arriving from an email link). */
@@ -140,6 +177,9 @@ export type OnlineErrorCode =
   | 'link_expired'
   | 'email_not_authorized'
   | 'name_taken'
+  | 'too_poor'
+  | 'unknown_item'
+  | 'wrong_password'
   | 'anonymous_disabled'
   | 'library_failed'
   | 'network'
@@ -211,9 +251,15 @@ export interface OnlineBackend {
   logOut(): Promise<void>;
   /** Email a password-reset link that brings the player back to this page. */
   requestPasswordReset(email: string): Promise<void>;
-  /** Set a new password (after arriving from a reset link, or while signed in). */
+  /** Set a new password after arriving from a reset link (the link signs the player in). */
   updatePassword(password: string): Promise<void>;
+  /** Signed in with email: check the current password, then set a new one. */
+  changePassword(current: string, next: string): Promise<void>;
   onAuthEvent(cb: (e: AuthEvent) => void): () => void;
+  /** The signed-in player's coins and items (database). */
+  getWallet(): Promise<ServerWallet>;
+  /** Buy (if needed) and equip a floor or skin; the server checks the price. */
+  buyItem(kind: 'floor' | 'skin', id: string): Promise<ServerWallet>;
   /** Is this display name free? (Names are unique, ignoring case.) */
   nameAvailable(name: string): Promise<boolean>;
   /** Create or rename the player's public profile (display name). */
@@ -380,9 +426,30 @@ export class SupabaseBackend implements OnlineBackend {
     if (error) throw toOnlineError(error);
   }
 
+  async changePassword(current: string, next: string): Promise<void> {
+    const email = this.sess?.email;
+    if (!this.sess || !email || this.sess.isGuest) throw new OnlineError('not_signed_in');
+    // Supabase does not ask for the old password itself, so check it first (also gives a fresh
+    // session, which "Secure password change" requires).
+    const check = await this.sb.auth.signInWithPassword({ email, password: current });
+    if (check.error) {
+      const e = toOnlineError(check.error);
+      throw e.code === 'invalid_credentials' ? new OnlineError('wrong_password') : e;
+    }
+    const { error } = await this.sb.auth.updateUser({ password: next });
+    if (error) throw toOnlineError(error);
+  }
+
   onAuthEvent(cb: (e: AuthEvent) => void): () => void {
     this.listeners.add(cb);
     return () => this.listeners.delete(cb);
+  }
+
+  getWallet() {
+    return this.call<ServerWallet>('cl_get_wallet');
+  }
+  buyItem(kind: 'floor' | 'skin', id: string) {
+    return this.call<ServerWallet>('cl_buy_item', { p_kind: kind, p_id: id });
   }
 
   nameAvailable(name: string): Promise<boolean> {

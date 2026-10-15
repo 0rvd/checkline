@@ -32,6 +32,7 @@ import {
 } from '../online/backend.js';
 import { readOnlineConfig, type ConfigResult } from '../online/config.js';
 import { fromWire, toWire } from '../online/wire.js';
+import { rankFor } from '../online/ranks.js';
 import {
   applyAction,
   carrier,
@@ -54,7 +55,7 @@ import { renderBoard } from './board.js';
 import { burstAt, confetti, flipTokens, flyBall, reducedMotion, setReduceMotion, snapshotTokens } from './motion.js';
 import { BALL_SVG, SVG_DEFS, moveDiagram, pieceSvg } from './pieces.js';
 import { play, setSoundEnabled } from './sound.js';
-import { applyTheme, awardMatch, buyOrEquip, findItem, loadWallet, type Award, type ItemKind, type Wallet } from './economy.js';
+import { applyTheme, awardMatch, buyOrEquip, findItem, fromServer, loadWallet, type Award, type ItemKind, type Wallet } from './economy.js';
 import {
   errorText,
   langSwitch,
@@ -65,6 +66,7 @@ import {
   renderShop,
   coinIcon,
   spinner,
+  tierChip,
   type AuthMode,
   type MenuAccount,
   type OnlineScreen,
@@ -146,6 +148,9 @@ export class App {
   private matchKey = '';
   /** What the finished match paid (shown on the full-time screen). */
   private lastAward: Award | null = null;
+  /** Signed in: coins and items live in the database (public."user" + public.user_cosmetics), never in this browser. */
+  private cloudWallet = false;
+  private cloudPaid = new Set<string>();
 
   // computer opponent
   private difficulty: Difficulty = 'medium';
@@ -174,6 +179,7 @@ export class App {
     busy: null,
     profile: null,
     renaming: false,
+    changingPassword: false,
     open: { loading: false, error: null, items: [] },
     mine: { loading: false, error: null, items: [] },
     waiting: null,
@@ -656,8 +662,15 @@ export class App {
     const session = be?.session() ?? null;
     if (!be || !session) {
       this.account = { state: 'signed-out' };
+      if (this.cloudWallet) {
+        // Back to this browser's own coins and items.
+        this.cloudWallet = false;
+        this.wallet = loadWallet();
+        applyTheme(this.wallet);
+      }
       return;
     }
+    void this.syncWallet();
     let name = session.displayName;
     try {
       name = (await be.myProfile())?.displayName ?? name;
@@ -665,6 +678,21 @@ export class App {
       /* keep the name from the account */
     }
     this.account = { state: 'signed-in', name, guest: session.isGuest };
+  }
+
+  /** Load the signed-in player's wallet from the database (falls back to this browser on error). */
+  private async syncWallet(): Promise<void> {
+    const be = this.backend;
+    if (!be?.session()) return;
+    try {
+      const sw = await be.getWallet();
+      this.wallet = fromServer(this.wallet, sw);
+      this.cloudWallet = true;
+      applyTheme(this.wallet);
+      this.requestRender();
+    } catch {
+      /* no profile yet, or the wallet table is not installed: keep using this browser's wallet */
+    }
   }
 
   private onAuthEvent(e: 'signed_in' | 'signed_out' | 'password_recovery'): void {
@@ -707,7 +735,7 @@ export class App {
     this.requestRender();
   }
 
-  private authError(code: 'invalid_email' | 'weak_password' | 'password_mismatch' | 'invalid_name'): void {
+  private authError(code: 'invalid_email' | 'weak_password' | 'password_mismatch' | 'invalid_name' | 'wrong_password'): void {
     this.ui.formError = new OnlineError(code);
     this.ui.notice = null;
     this.requestRender();
@@ -784,6 +812,22 @@ export class App {
     this.showToast(() => t('auth.recovery.done'));
   }
 
+  /** Signed in with email: change the password (the current one is checked first). */
+  private async changePassword(current: string, next: string, next2: string): Promise<void> {
+    if (!current) return this.authError('wrong_password');
+    if (next.length < 6) return this.authError('weak_password');
+    if (next !== next2) return this.authError('password_mismatch');
+    const ok = await this.onlineBusy('change-password', async (be) => {
+      await be.changePassword(current, next);
+      return true;
+    });
+    if (!ok) return;
+    this.ui.changingPassword = false;
+    this.ui.showPassword = false;
+    this.requestRender();
+    this.showToast(() => t('auth.changePw.done'));
+  }
+
   private async saveProfile(name: string): Promise<void> {
     const profile = await this.onlineBusy('profile', (be) => be.saveProfile(name));
     if (!profile) return;
@@ -805,7 +849,7 @@ export class App {
     } catch {
       /* signed out locally even if the server call failed */
     }
-    this.ui = { ...this.ui, phase: 'auth', authMode: 'login', session: null, profile: null, uid: null, formError: null, notice: null, renaming: false };
+    this.ui = { ...this.ui, phase: 'auth', authMode: 'login', session: null, profile: null, uid: null, formError: null, notice: null, renaming: false, changingPassword: false };
     this.ui.open = { loading: false, error: null, items: [] };
     this.ui.mine = { loading: false, error: null, items: [] };
     this.account = { state: 'signed-out' };
@@ -1382,6 +1426,7 @@ export class App {
         this.requestRender();
         return;
       case 'menu':
+        if (this.cloudWallet) void this.syncWallet();
         this.goScreen('menu');
         return;
       case 'play-local':
@@ -1491,6 +1536,13 @@ export class App {
         this.ui.formError = null;
         this.requestRender();
         return;
+      case 'online-change-pw':
+      case 'online-change-pw-cancel':
+        this.ui.changingPassword = act === 'online-change-pw';
+        this.ui.renaming = false;
+        this.ui.formError = null;
+        this.requestRender();
+        return;
       case 'online-copy':
         void this.copyCode();
         return;
@@ -1517,6 +1569,7 @@ export class App {
         this.openLeaderboard();
         return;
       case 'shop':
+        if (this.cloudWallet) void this.syncWallet();
         this.goScreen('shop');
         return;
       case 'shop-item':
@@ -1573,6 +1626,9 @@ export class App {
         return;
       case 'new-password':
         void this.newPassword(String(data.get('auth-password') ?? ''), String(data.get('auth-password2') ?? ''));
+        return;
+      case 'change-password':
+        void this.changePassword(String(data.get('pw-current') ?? ''), String(data.get('pw-new') ?? ''), String(data.get('pw-new2') ?? ''));
         return;
       case 'join':
         void this.joinOnline(String(data.get('code') ?? ''));
@@ -1707,7 +1763,7 @@ export class App {
         });
         break;
       case 'shop':
-        html = renderShop(this.wallet);
+        html = renderShop(this.wallet, this.cloudWallet);
         break;
       case 'ai-setup':
         html = renderAiSetup({ difficulty: this.difficulty, side: this.aiSide });
@@ -2114,12 +2170,27 @@ export class App {
     const team = this.overlay.team;
     // Win bonus when *you* won: against the computer or an online opponent. Local hot-seat
     // matches count towards the match bonus only (both players share this device).
-    const won = !!team && ((this.kind === 'ai' && team === this.humanTeam) || (this.kind === 'online' && team === this.og?.myTeam));
+    const won = !!team && this.kind === 'ai' && team === this.humanTeam;
+    if (this.kind === 'online') {
+      // Scored on the server together with the result (coins + rank points); just reload.
+      if (!this.cloudPaid.has(this.matchKey)) {
+        this.cloudPaid.add(this.matchKey);
+        void this.syncWallet();
+      }
+      return;
+    }
+    // Signed in: the account balance only changes on the server, which cannot verify matches
+    // played in this browser, so they pay nothing (and never touch the browser wallet either).
+    if (this.cloudWallet) return;
     const award = awardMatch(this.wallet, this.matchKey, won);
     if (award) this.lastAward = award;
   }
 
   private shopItem(kind: ItemKind, id: string): void {
+    if (this.cloudWallet && this.backend) {
+      void this.shopItemCloud(this.backend, kind, id);
+      return;
+    }
     const item = findItem(kind, id);
     if (!item) return;
     const name = () => t(`${kind}.${id}.name` as MessageKey);
@@ -2133,9 +2204,26 @@ export class App {
     this.showToast(() => t(res === 'bought' ? 'shop.bought' : 'shop.equippedToast', { name: name() }));
   }
 
+  private async shopItemCloud(be: OnlineBackend, kind: ItemKind, id: string): Promise<void> {
+    const had = this.wallet.owned.includes(`${kind}:${id}`);
+    try {
+      this.wallet = fromServer(this.wallet, await be.buyItem(kind, id));
+      applyTheme(this.wallet);
+      play(had ? 'move' : 'goal');
+      this.showToast(() => t(had ? 'shop.equippedToast' : 'shop.bought', { name: t(`${kind}.${id}.name` as MessageKey) }));
+    } catch (e) {
+      const err = toOnlineError(e);
+      play('error');
+      this.showToast(() => (err.code === 'too_poor' ? t('shop.tooPoor') : errorText(err)));
+    }
+  }
+
   private awardHtml(): string {
+    if (this.kind === 'tutorial') return '';
+    if (this.kind === 'online') return this.onlineAwardHtml();
+    if (this.cloudWallet) return `<div class="award"><p class="small muted">${esc(t('ov.coinsOnlineOnly'))}</p></div>`;
     const a = this.lastAward;
-    if (!a || this.kind === 'tutorial') return '';
+    if (!a) return '';
     const parts: string[] = [];
     if (a.win) parts.push(t('ov.coinsWin', { n: a.win }));
     if (a.bonus) parts.push(t('ov.coinsBonus', { n: a.bonus }));
@@ -2143,6 +2231,30 @@ export class App {
     return `<div class="award ${a.coins ? 'paid' : ''}">
         ${a.coins ? `<p class="award-total">${coinIcon()}<strong dir="ltr">+${a.coins}</strong> <span>${esc(t('ov.coinsEarned'))}</span></p>` : ''}
         <p class="small muted">${esc([...parts, next].join(' · '))}</p>
+      </div>`;
+  }
+
+  /** Online: coins and C-rank points come straight from the server's result row. */
+  private onlineAwardHtml(): string {
+    const og = this.og;
+    const r = og?.match.result;
+    if (!og || !r) return '';
+    const mine = og.myTeam === 'A';
+    const coins = (mine ? r.aCoins : r.bCoins) ?? 0;
+    const before = mine ? r.aPointsBefore : r.bPointsBefore;
+    const after = mine ? r.aPointsAfter : r.bPointsAfter;
+    const iWon = r.winnerId !== null && r.winnerId === (og.myTeam === 'A' ? og.match.playerA.id : og.match.playerB?.id);
+    let rank: string;
+    if (!r.ranked || before == null || after == null) {
+      rank = `<p class="small muted">${esc(t('rank.unranked'))}</p>`;
+    } else {
+      const d = after - before;
+      const note = iWon && d === 0 && r.rankNote ? `<p class="small muted">${esc(t(`rank.note.${r.rankNote}` as MessageKey))}</p>` : '';
+      rank = `<p class="rank-change">${tierChip(rankFor(after).tier)} <span dir="ltr" class="rating-change ${d >= 0 ? 'up' : 'down'}">${before} → <strong>${after}</strong> (${d >= 0 ? '+' : ''}${d})</span> <span class="small muted">${esc(t('rank.points'))}</span></p>${note}`;
+    }
+    return `<div class="award ${coins ? 'paid' : ''}">
+        ${coins ? `<p class="award-total">${coinIcon()}<strong dir="ltr">+${coins}</strong> <span>${esc(t('ov.coinsEarned'))}</span></p>` : ''}
+        ${rank}
       </div>`;
   }
 

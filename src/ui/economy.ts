@@ -1,4 +1,9 @@
-// Coins, the shop and cosmetic themes. Everything is stored in this browser (localStorage).
+// Coins, the shop and cosmetic themes. Signed-out players keep them in this browser (localStorage);
+// signed-in players keep them in the database (public."user", public.user_cosmetics and
+// public.coin_transactions in supabase/setup.sql). The browser wallet never overwrites the
+// database one: when signed in, the game only reads the server wallet and asks the server to buy.
+// Signed-in players earn coins from online matches only (scored on the server); matches against
+// the computer cannot be verified by the server, so they pay only the browser wallet.
 // Cosmetic only: floors and skins never change the rules.
 //
 // Earning: every finished match counts; every 3rd finished match pays MATCH_BONUS coins,
@@ -39,6 +44,8 @@ export interface Wallet {
   skin: string;
   /** Match keys already paid (most recent last, capped). */
   paid: string[];
+  /** Signed in: live prices from public.cosmetics ("skin:gold" -> 25). */
+  prices?: Record<string, number>;
 }
 
 export interface Award {
@@ -80,6 +87,11 @@ export function saveWallet(w: Wallet): void {
 export const owns = (w: Wallet, kind: ItemKind, id: string): boolean => w.owned.includes(`${kind}:${id}`);
 export const equipped = (w: Wallet, kind: ItemKind): string => (kind === 'floor' ? w.floor : w.skin);
 export const findItem = (kind: ItemKind, id: string): ShopItem | undefined => SHOP_ITEMS.find((i) => i.kind === kind && i.id === id);
+/** Price shown in the shop: the database price when signed in, otherwise the built-in one. */
+export const priceOf = (w: Wallet, it: ShopItem): number => {
+  const p = w.prices?.[`${it.kind}:${it.id}`];
+  return typeof p === 'number' && p >= 0 ? p : it.price;
+};
 
 /** Pay for a finished match once. Returns what was earned, or null if this match was already paid. */
 export function awardMatch(w: Wallet, matchKey: string, won: boolean): Award | null {
@@ -119,4 +131,25 @@ export function applyTheme(w: Wallet): void {
   if (typeof document === 'undefined') return;
   document.documentElement.dataset.floor = w.floor;
   document.documentElement.dataset.skin = w.skin;
+}
+
+/** Take the coins and items stored in the database (signed-in players) into the in-memory wallet. */
+export function fromServer(
+  local: Wallet,
+  s: { coins: number; matches: number; wins: number; owned: string[]; floor: string; skin: string; prices?: Record<string, number> },
+): Wallet {
+  const owned = Array.from(new Set(['floor:classic', 'skin:classic', ...(Array.isArray(s.owned) ? s.owned : [])]));
+  const w: Wallet = {
+    ...local,
+    coins: Math.max(0, Math.floor(Number(s.coins) || 0)),
+    matches: Number(s.matches) || 0,
+    wins: Number(s.wins) || 0,
+    owned,
+    floor: s.floor,
+    skin: s.skin,
+    prices: s.prices && typeof s.prices === 'object' ? s.prices : undefined,
+  };
+  if (!owned.includes(`floor:${w.floor}`) || !findItem('floor', w.floor)) w.floor = 'classic';
+  if (!owned.includes(`skin:${w.skin}`) || !findItem('skin', w.skin)) w.skin = 'classic';
+  return w;
 }

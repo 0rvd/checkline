@@ -3,7 +3,7 @@
 create role anon nologin;
 create role authenticated nologin;
 create schema auth;
-create table auth.users (id uuid primary key, is_anonymous boolean not null default true, raw_user_meta_data jsonb not null default '{}'::jsonb);
+create table auth.users (id uuid primary key, email text, created_at timestamptz not null default now(), is_anonymous boolean not null default true, raw_user_meta_data jsonb not null default '{}'::jsonb);
 -- Same contract as Supabase's auth.uid(): the `sub` claim of the caller's JWT.
 create function auth.uid() returns uuid language sql stable as $$
   select nullif(coalesce(current_setting('request.jwt.claim.sub', true), ''), '')::uuid

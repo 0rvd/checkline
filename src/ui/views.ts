@@ -3,8 +3,9 @@ import type { Difficulty } from '../ai/ai.js';
 import { escapeHtml as esc, getLang, t, tHtml, teamName, type MessageKey } from '../i18n/index.js';
 import type { AuthSession, LeaderboardPage, OnlineError, OnlineMatch, OnlineProfile } from '../online/backend.js';
 import type { ConfigProblem } from '../online/config.js';
+import { rankFor, tierProgress, type RankInfo } from '../online/ranks.js';
 import type { PieceKind, Team } from '../rules/types.js';
-import { MATCHES_PER_BONUS, MATCH_BONUS, SHOP_ITEMS, WIN_BONUS, equipped, owns, type ShopItem, type Wallet } from './economy.js';
+import { MATCHES_PER_BONUS, MATCH_BONUS, SHOP_ITEMS, WIN_BONUS, equipped, owns, priceOf, type ShopItem, type Wallet } from './economy.js';
 import { BALL_SVG, pieceSvg } from './pieces.js';
 
 export function langSwitch(): string {
@@ -172,6 +173,7 @@ export interface OnlineScreen {
   busy: string | null;
   profile: OnlineProfile | null;
   renaming: boolean;
+  changingPassword: boolean;
   open: ListState;
   mine: ListState;
   waiting: OnlineMatch | null;
@@ -381,7 +383,7 @@ function matchRow(m: OnlineMatch, s: OnlineScreen, mine: boolean): string {
       <button class="btn small ${m.status === 'active' && m.state?.turn === myTeam ? 'primary' : ''}" data-act="online-open" data-id="${m.id}">${esc(t('online.resume'))}</button></li>`;
   }
   return `<li class="match-row">
-    <div><strong>${esc(m.playerA.name)}</strong> <span class="rating-chip" dir="ltr">${m.playerA.rating}</span>
+    <div><strong>${esc(m.playerA.name)}</strong> ${tierChip(m.playerA.tier)} <span class="rating-chip" dir="ltr">${m.playerA.rating}</span>
     <span class="muted small">${esc(ago(m.createdAt, s.serverSkewMs))}</span></div>
     <button class="btn small primary" data-act="online-join-open" data-code="${esc(m.code)}" ${s.busy ? 'disabled' : ''}>${esc(t('online.open.join'))}</button></li>`;
 }
@@ -395,8 +397,46 @@ function listBlock(title: MessageKey, l: ListState, s: OnlineScreen, mine: boole
   return `<section class="card"><div class="card-head"><h2>${esc(t(title))}</h2>${extra}</div>${body}</section>`;
 }
 
+/** Small C-rank badge (C5 ... C1). */
+export function tierChip(tier: string | undefined, big = false): string {
+  if (!tier) return '';
+  return `<span class="tier-chip tier-${esc(tier.toLowerCase())} ${big ? 'big' : ''}" dir="ltr" title="${esc(t('rank.title'))}">${esc(tier)}</span>`;
+}
+
+function rankOf(p: OnlineProfile): RankInfo {
+  const base = rankFor(p.rankPoints ?? 0);
+  return { ...base, tier: p.tier ?? base.tier, tierMin: p.tierMin ?? base.tierMin, nextTierAt: p.nextTierAt === undefined ? base.nextTierAt : p.nextTierAt };
+}
+
+function rankBlock(p: OnlineProfile, guest: boolean): string {
+  const r = rankOf(p);
+  const pct = Math.round(tierProgress(r) * 100);
+  const next =
+    r.nextTierAt === null ? t('rank.top') : t('rank.toNext', { n: r.nextTierAt - r.rankPoints, tier: rankFor(r.nextTierAt).tier });
+  return `<div class="rank-block">
+      <div class="rank-line">${tierChip(r.tier, true)}<span><strong dir="ltr">${r.rankPoints}</strong> ${esc(t('rank.points'))}</span>
+      <span class="small muted">${esc(guest ? t('rank.guest') : next)}</span></div>
+      <div class="rank-bar" role="progressbar" aria-label="${esc(t('rank.title'))}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div>
+    </div>`;
+}
+
+function changePasswordForm(s: OnlineScreen): string {
+  return `<form class="card form inline pw-form" data-form="change-password" novalidate>
+      <h2>${esc(t('auth.changePw.title'))}</h2>
+      ${passwordField(s, 'pw-current', 'auth.changePw.current', 'current-password')}
+      ${passwordField(s, 'pw-new', 'auth.newPassword', 'new-password', 'auth.passwordHint')}
+      ${passwordField(s, 'pw-new2', 'auth.password2', 'new-password')}
+      ${formError(s)}
+      <div class="row">
+        <button class="btn primary" type="submit" ${s.busy ? 'disabled' : ''}>${busyLabel(s, 'change-password', 'auth.changePw.submit')}</button>
+        <button class="btn ghost" type="button" data-act="online-change-pw-cancel">${esc(t('common.cancel'))}</button>
+      </div>
+    </form>`;
+}
+
 function renderLobby(s: OnlineScreen): string {
   const p = s.profile!;
+  const guest = !!(s.session?.isGuest ?? p.isGuest);
   const profileCard = s.renaming
     ? `<form class="card form inline" data-form="rename" novalidate>
         <label for="rename-name">${esc(t('online.signin.label'))}</label>
@@ -413,20 +453,24 @@ function renderLobby(s: OnlineScreen): string {
             <span class="rating-chip big" dir="ltr">${p.rating}</span>
             <span class="muted">${esc(t('online.record', { w: p.wins, d: p.draws ?? 0, l: p.losses }))}</span></div>
             <span class="small muted account-line">${
-              s.session?.isGuest ? esc(t('auth.guestAccount')) : esc(t('auth.signedInAs')) + ` <bdi dir="ltr">${esc(s.session?.email ?? '')}</bdi>`
+              guest ? esc(t('auth.guestAccount')) : esc(t('auth.signedInAs')) + ` <bdi dir="ltr">${esc(s.session?.email ?? p.email ?? '')}</bdi>`
             }</span>
           </div>
         </div>
+        ${rankBlock(p, guest)}
         <div class="row">
           <button class="btn ghost small" data-act="online-rename">${esc(t('online.rename'))}</button>
+          ${guest ? '' : `<button class="btn ghost small" data-act="online-change-pw">${esc(t('auth.changePw.open'))}</button>`}
           <button class="btn ghost small" data-act="logout">${esc(t('auth.logout'))}</button>
         </div>
       </section>`;
+  const pwCard = s.changingPassword && !guest ? changePasswordForm(s) : '';
   return `
     <main class="page lobby screen-enter">
       ${head('online.title')}
       ${profileCard}
-      ${!s.renaming ? formError(s) : ''}
+      ${pwCard}
+      ${!s.renaming && !pwCard ? formError(s) : ''}
       <div class="lobby-grid">
         <section class="card">
           <h2>${esc(t('online.create.title'))}</h2>
@@ -485,7 +529,7 @@ export function renderLeaderboard(s: LeaderboardScreen): string {
   const pages = Math.max(1, Math.ceil((s.data?.total ?? 0) / s.pageSize));
   let body: string;
   if (s.loading && !s.data) {
-    body = `<div class="table-wrap"><table class="lb"><tbody>${'<tr class="skeleton"><td colspan="6"><span></span></td></tr>'.repeat(6)}</tbody></table></div>`;
+    body = `<div class="table-wrap"><table class="lb"><tbody>${'<tr class="skeleton"><td colspan="7"><span></span></td></tr>'.repeat(6)}</tbody></table></div>`;
   } else if (s.error) {
     body = `<div class="card notice error-card" role="alert"><p>${esc(t('lb.error'))} ${esc(errorText(s.error))}</p>
       <button class="btn primary" data-act="lb-retry">${esc(t('common.retry'))}</button></div>`;
@@ -496,7 +540,8 @@ export function renderLeaderboard(s: LeaderboardScreen): string {
       .map(
         (r) => `<tr class="${r.id === s.uid ? 'me' : ''} ${r.rank <= 3 ? 'podium p' + r.rank : ''}">
           <td class="num rank">${r.rank}</td>
-          <td class="name"><bdi>${esc(r.displayName)}</bdi>${r.id === s.uid ? ` <span class="you-chip">${esc(t('lb.you'))}</span>` : ''}</td>
+          <td class="name"><bdi>${esc(r.displayName)}</bdi>${r.id === s.uid ? ` <span class="you-chip">${esc(t('lb.you'))}</span>` : ''}<span class="tier-inline"> ${tierChip(r.tier ?? rankFor(r.rankPoints ?? 0).tier)}</span></td>
+          <td class="tier-cell">${tierChip(r.tier ?? rankFor(r.rankPoints ?? 0).tier)}</td>
           <td class="num rating">${r.rating}</td><td class="num">${r.wins}</td><td class="num">${r.draws ?? 0}</td><td class="num">${r.losses}</td></tr>`,
       )
       .join('');
@@ -504,7 +549,7 @@ export function renderLeaderboard(s: LeaderboardScreen): string {
       <div class="table-wrap ${s.loading ? 'is-loading' : ''}">
         <table class="lb">
           <thead><tr><th scope="col" class="num">${esc(t('lb.rank'))}</th><th scope="col">${esc(t('lb.player'))}</th>
-          <th scope="col" class="num">${esc(t('lb.rating'))}</th><th scope="col" class="num"><abbr title="${esc(t('lb.winsFull'))}">${esc(t('lb.wins'))}</abbr></th>
+          <th scope="col" class="tier-cell">${esc(t('lb.tier'))}</th><th scope="col" class="num">${esc(t('lb.rating'))}</th><th scope="col" class="num"><abbr title="${esc(t('lb.winsFull'))}">${esc(t('lb.wins'))}</abbr></th>
           <th scope="col" class="num"><abbr title="${esc(t('lb.drawsFull'))}">${esc(t('lb.draws'))}</abbr></th>
           <th scope="col" class="num"><abbr title="${esc(t('lb.lossesFull'))}">${esc(t('lb.losses'))}</abbr></th></tr></thead>
           <tbody>${rows}</tbody>
@@ -547,28 +592,29 @@ function skinPreview(id: string): string {
 function shopCard(w: Wallet, it: ShopItem): string {
   const has = owns(w, it.kind, it.id);
   const on = equipped(w, it.kind) === it.id;
-  const affordable = w.coins >= it.price;
+  const price = priceOf(w, it);
+  const affordable = w.coins >= price;
   const name = t(`${it.kind}.${it.id}.name` as MessageKey);
   let button: string;
   if (on) button = `<button class="btn small equipped-btn" disabled>✓ ${esc(t('shop.equipped'))}</button>`;
   else if (has) button = `<button class="btn small" data-act="shop-item" data-kind="${it.kind}" data-id="${it.id}">${esc(t('shop.equip'))}</button>`;
   else if (affordable)
-    button = `<button class="btn small primary" data-act="shop-item" data-kind="${it.kind}" data-id="${it.id}">${esc(t('shop.unlock'))} · ${coinIcon()}<span dir="ltr">${it.price}</span></button>`;
-  else button = `<button class="btn small" disabled><span aria-hidden="true">🔒</span> ${esc(t('shop.need', { n: it.price }))}</button>`;
+    button = `<button class="btn small primary" data-act="shop-item" data-kind="${it.kind}" data-id="${it.id}">${esc(t('shop.unlock'))} · ${coinIcon()}<span dir="ltr">${price}</span></button>`;
+  else button = `<button class="btn small" disabled><span aria-hidden="true">🔒</span> ${esc(t('shop.need', { n: price }))}</button>`;
   const tag = on ? 'equipped' : has ? 'owned' : 'locked';
-  const tagText = on ? t('shop.equipped') : has ? (it.price === 0 ? t('shop.free') : t('shop.owned')) : '';
+  const tagText = on ? t('shop.equipped') : has ? (price === 0 ? t('shop.free') : t('shop.owned')) : '';
   return `
     <article class="shop-item ${tag}" aria-label="${esc(name)}">
       ${it.kind === 'floor' ? floorPreview(it.id) : skinPreview(it.id)}
       <div class="shop-info">
-        <div class="shop-name"><strong>${esc(name)}</strong>${tagText ? `<span class="shop-tag">${esc(tagText)}</span>` : `<span class="price">${coinIcon()}<span dir="ltr">${it.price}</span></span>`}</div>
+        <div class="shop-name"><strong>${esc(name)}</strong>${tagText ? `<span class="shop-tag">${esc(tagText)}</span>` : `<span class="price">${coinIcon()}<span dir="ltr">${price}</span></span>`}</div>
         <p class="muted small">${esc(t(`${it.kind}.${it.id}.desc` as MessageKey))}</p>
       </div>
       ${button}
     </article>`;
 }
 
-export function renderShop(w: Wallet): string {
+export function renderShop(w: Wallet, cloud = false): string {
   const toNext = MATCHES_PER_BONUS - (w.matches % MATCHES_PER_BONUS);
   const pips = Array.from({ length: MATCHES_PER_BONUS }, (_, i) => `<i class="${i < MATCHES_PER_BONUS - toNext ? 'on' : ''}"></i>`).join('');
   const section = (kind: 'floor' | 'skin', title: MessageKey) => `
@@ -578,14 +624,14 @@ export function renderShop(w: Wallet): string {
     <main class="page shop screen-enter">
       ${head('shop.title')}
       <section class="card wallet-card">
-        <div class="wallet-balance">${coinIcon()}<strong dir="ltr">${w.coins}</strong><span class="muted">${esc(t('shop.coins'))}</span></div>
+        <div class="wallet-balance">${coinIcon()}<strong dir="ltr">${w.coins}</strong><span class="muted">${esc(t('shop.coins'))}</span>${cloud ? `<span class="cloud-tag" title="${esc(t('shop.noteCloud'))}">${esc(t('shop.cloud'))}</span>` : ''}</div>
         <div class="wallet-earn">
-          <p class="small">${esc(t('shop.earn', { win: WIN_BONUS, bonus: MATCH_BONUS, every: MATCHES_PER_BONUS }))}</p>
+          <p class="small">${esc(t(cloud ? 'shop.earnCloud' : 'shop.earn', { win: WIN_BONUS, bonus: MATCH_BONUS, every: MATCHES_PER_BONUS }))}</p>
           <div class="bonus-meter" aria-label="${esc(t('shop.nextBonus', { n: toNext }))}"><span class="pips">${pips}</span><span class="small muted">${esc(t('shop.nextBonus', { n: toNext }))}</span></div>
         </div>
       </section>
       ${section('floor', 'shop.floors')}
       ${section('skin', 'shop.skins')}
-      <p class="fine">${esc(t('shop.note'))}</p>
+      <p class="fine">${esc(t(cloud ? 'shop.noteCloud' : 'shop.note'))}</p>
     </main>`;
 }
