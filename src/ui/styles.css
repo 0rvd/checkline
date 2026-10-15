@@ -1055,6 +1055,7 @@ bdi { unicode-bidi: isolate; }
 .brand .brand-fallback { display: none; line-height: 1; }
 .brand.no-logo { line-height: 1; }
 .brand.no-logo .brand-fallback { display: block; }
+.brand.no-logo .brand-logo { display: none; } /* image missing: hide the broken image, show the text title */
 @media (max-width: 760px) { .brand-logo { max-width: 440px; margin-inline: auto; } }
 
 /* Splash / loading screen (index.html). */
