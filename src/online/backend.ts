@@ -118,15 +118,20 @@ export interface ServerWallet {
   owned: string[];
   floor: string;
   skin: string;
-  /** Live prices from public.cosmetics ("skin:gold" -> 25). */
+  ball: string;
+  /** Live prices from public.cosmetics and public.bundles ("skin:gold" -> 25, "bundle:cosmic" -> 70). */
   prices?: Record<string, number>;
 }
 
 /** Auth changes the UI reacts to (e.g. arriving from an email link). */
 export type AuthEvent = 'signed_in' | 'signed_out' | 'password_recovery';
 
-/** Turn timer for online matches (seconds); the server enforces the same value. */
-export const TURN_SECONDS = 90;
+/** Every human-controlled turn lasts this many seconds (local, computer and online play).
+ *  Online, the server enforces it (checkline_private.turn_deadline in supabase/setup.sql). */
+export const TURN_SECONDS = 25;
+/** Online only: extra seconds the server allows for network delay and the opponent's move
+ *  animation before the deadline. The clock never shows more than TURN_SECONDS. */
+export const TURN_GRACE_SECONDS = 3;
 
 /** Raw row pushed by Realtime for cl_matches (snake_case). */
 export interface MatchRowChange {
@@ -162,6 +167,7 @@ export type OnlineErrorCode =
   | 'bad_action'
   | 'opponent_still_connected'
   | 'turn_time_left'
+  | 'turn_expired'
   | 'match_outdated'
   | 'try_again'
   | 'invalid_credentials'
@@ -258,8 +264,10 @@ export interface OnlineBackend {
   onAuthEvent(cb: (e: AuthEvent) => void): () => void;
   /** The signed-in player's coins and items (database). */
   getWallet(): Promise<ServerWallet>;
-  /** Buy (if needed) and equip a floor or skin; the server checks the price. */
-  buyItem(kind: 'floor' | 'skin', id: string): Promise<ServerWallet>;
+  /** Buy (if needed) and equip a floor, skin or ball; the server checks the price. */
+  buyItem(kind: 'floor' | 'skin' | 'ball', id: string): Promise<ServerWallet>;
+  /** Buy (if needed) and equip a full set; the server prices it and adds all items at once. */
+  buyBundle(id: string): Promise<ServerWallet>;
   /** Is this display name free? (Names are unique, ignoring case.) */
   nameAvailable(name: string): Promise<boolean>;
   /** Create or rename the player's public profile (display name). */
@@ -274,8 +282,9 @@ export interface OnlineBackend {
   heartbeat(id: string): Promise<void>;
   resign(id: string): Promise<OnlineMatch>;
   claimForfeit(id: string): Promise<OnlineMatch>;
-  /** End the opponent's turn after the 90-second turn timer runs out (server-checked). */
-  claimTimeout(id: string): Promise<OnlineMatch>;
+  /** End the current turn once its deadline has passed (either player may ask; the server
+   *  checks the time and that `expectedVersion` is still current, so it happens only once). */
+  claimTimeout(id: string, expectedVersion: number): Promise<OnlineMatch>;
   cancelMatch(id: string): Promise<OnlineMatch>;
   leaderboard(offset: number, limit: number): Promise<LeaderboardPage>;
   subscribeMatch(id: string, handlers: MatchSubscription): () => void;
@@ -448,8 +457,11 @@ export class SupabaseBackend implements OnlineBackend {
   getWallet() {
     return this.call<ServerWallet>('cl_get_wallet');
   }
-  buyItem(kind: 'floor' | 'skin', id: string) {
+  buyItem(kind: 'floor' | 'skin' | 'ball', id: string) {
     return this.call<ServerWallet>('cl_buy_item', { p_kind: kind, p_id: id });
+  }
+  buyBundle(id: string) {
+    return this.call<ServerWallet>('cl_buy_bundle', { p_id: id });
   }
 
   nameAvailable(name: string): Promise<boolean> {
@@ -496,8 +508,8 @@ export class SupabaseBackend implements OnlineBackend {
   cancelMatch(id: string) {
     return this.call<OnlineMatch>('cl_cancel_match', { p_match_id: id });
   }
-  claimTimeout(id: string) {
-    return this.call<OnlineMatch>('cl_claim_timeout', { p_match_id: id });
+  claimTimeout(id: string, expectedVersion: number) {
+    return this.call<OnlineMatch>('cl_claim_timeout', { p_match_id: id, p_expected_version: expectedVersion });
   }
   leaderboard(offset: number, limit: number) {
     return this.call<LeaderboardPage>('cl_get_leaderboard', { p_offset: offset, p_limit: limit });

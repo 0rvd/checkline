@@ -5,7 +5,22 @@ import type { AuthSession, LeaderboardPage, OnlineError, OnlineMatch, OnlineProf
 import type { ConfigProblem } from '../online/config.js';
 import { rankFor, tierProgress, type RankInfo } from '../online/ranks.js';
 import type { PieceKind, Team } from '../rules/types.js';
-import { MATCHES_PER_BONUS, MATCH_BONUS, SHOP_ITEMS, WIN_BONUS, equipped, owns, priceOf, type ShopItem, type Wallet } from './economy.js';
+import {
+  BUNDLES,
+  MATCHES_PER_BONUS,
+  MATCH_BONUS,
+  SHOP_ITEMS,
+  WIN_BONUS,
+  bundleQuote,
+  equipped,
+  findItem,
+  owns,
+  priceOf,
+  type Bundle,
+  type ItemKind,
+  type ShopItem,
+  type Wallet,
+} from './economy.js';
 import { BALL_SVG, pieceSvg } from './pieces.js';
 
 export function langSwitch(): string {
@@ -71,9 +86,9 @@ function coinChip(coins: number): string {
 }
 
 export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: MenuAccount | null; coins?: number }): string {
-  const item = (act: string, title: MessageKey, sub: MessageKey, cls = '', extra = '') => `
+  const item = (act: string, title: MessageKey, sub: MessageKey, cls = '', extra = '', emoji = '') => `
     <button class="mode-card ${cls}" data-act="${act}">
-      <span class="mode-title">${esc(t(title))}</span>
+      <span class="mode-title">${emoji ? `<span class="mode-emoji" aria-hidden="true">${emoji}</span>` : ''}${esc(t(title))}</span>
       <span class="mode-sub">${esc(t(sub))}</span>${extra}
     </button>`;
   const feats: MessageKey[] = ['menu.feat.dribble', 'menu.feat.pass', 'menu.feat.shoot', 'menu.feat.tackle'];
@@ -93,13 +108,13 @@ export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: Me
         </div>
         ${o.resume ? `<button class="btn primary resume" data-act="online-resume">${esc(t('menu.resume'))}</button>` : ''}
         <div class="mode-grid">
-          ${item('ai-setup', 'menu.vsComputer', 'menu.vsComputer.sub', 'featured')}
-          ${item('play-local', 'menu.local', 'menu.local.sub')}
-          ${item('online', 'menu.online', o.onlineOk ? 'menu.online.sub' : 'menu.online.off', o.onlineOk ? '' : 'muted-card')}
-          ${item('leaderboard', 'menu.leaderboard', o.onlineOk ? 'menu.leaderboard.sub' : 'menu.online.off', o.onlineOk ? '' : 'muted-card')}
-          ${item('tutorial', 'menu.tutorial', 'menu.tutorial.sub')}
+          ${item('ai-setup', 'menu.vsComputer', 'menu.vsComputer.sub', 'featured', '', '🤖')}
+          ${item('play-local', 'menu.local', 'menu.local.sub', '', '', '👥')}
+          ${item('online', 'menu.online', o.onlineOk ? 'menu.online.sub' : 'menu.online.off', o.onlineOk ? '' : 'muted-card', '', '🌐')}
+          ${item('leaderboard', 'menu.leaderboard', o.onlineOk ? 'menu.leaderboard.sub' : 'menu.online.off', o.onlineOk ? '' : 'muted-card', '', '🏆')}
+          ${item('tutorial', 'menu.tutorial', 'menu.tutorial.sub', '', '', '🎓')}
           <button class="mode-card shop-card" data-act="shop">
-            <span class="mode-title">${coinIcon()}${esc(t('menu.shop'))}</span>
+            <span class="mode-title">${coinIcon()}${esc(t('menu.shop'))}<span class="mode-emoji trail" aria-hidden="true">🛍️</span></span>
             <span class="mode-sub">${esc(t('menu.shop.sub', { n: o.coins ?? 0 }))}</span>
           </button>
           <button class="mode-card ghost" data-act="rules"><span class="mode-title">${esc(t('menu.rules'))}</span></button>
@@ -572,21 +587,47 @@ export function renderLeaderboard(s: LeaderboardScreen): string {
 }
 
 // ------------------------------------------------------------------ shop
-/** Mini pitch showing a floor theme (uses the same CSS variables as the real pitch). */
-function floorPreview(id: string): string {
+/** Category emoji (decoration only: every category also has a text label). */
+const KIND_EMOJI: Record<ItemKind, string> = { floor: '🏟️', skin: '♟️', ball: '⚽' };
+const emoji = (e: string, cls = '') => `<span class="emoji ${cls}" aria-hidden="true">${e}</span>`;
+
+/** Animated floors (cost more): marked in the shop. */
+const ANIMATED_FLOORS = new Set(['aurora', 'synthwave', 'galaxy', 'prism']);
+
+/** Mini pitch showing a floor theme (uses the same CSS variables and overlay as the real pitch). */
+function floorPreview(id: string, inner = ''): string {
   return `<div class="floor-preview theme-floor-${id}" aria-hidden="true">
       <div class="fp-net"></div>
       <div class="fp-grid">${'<i></i>'.repeat(24)}</div>
+      <div class="fp-fx"></div>
       <svg class="fp-lines" viewBox="0 0 6 4" preserveAspectRatio="none"><rect x="1" y="0.04" width="4" height="1.2" vector-effect="non-scaling-stroke"/><line x1="0" y1="3.96" x2="6" y2="3.96" vector-effect="non-scaling-stroke"/><circle cx="3" cy="4" r="1" vector-effect="non-scaling-stroke"/></svg>
+      ${inner}
     </div>`;
 }
 
 /** Two sample pieces (one per team) wearing a skin. */
 function skinPreview(id: string): string {
-  return `<div class="skin-preview theme-skin-${id}" aria-hidden="true">
+  return `<div class="skin-preview theme-skin-${id} theme-ball-classic" aria-hidden="true">
       <div class="token team-A kind-queen carrier">${pieceSvg('queen')}<span class="ball">${BALL_SVG}</span></div>
       <div class="token team-B kind-knight">${pieceSvg('knight')}</div>
     </div>`;
+}
+
+/** A ball skin, large, bouncing on grass. */
+function ballPreview(id: string): string {
+  return `<div class="ball-preview theme-ball-${id}" aria-hidden="true"><span class="ball">${BALL_SVG}</span><i class="ball-shadow"></i></div>`;
+}
+
+/** A whole set: the floor, with a piece of the skin carrying the ball. */
+function bundlePreview(b: Bundle): string {
+  const pick = (k: ItemKind) => b.items.find((i) => i.kind === k)?.id ?? 'classic';
+  return floorPreview(
+    pick('floor'),
+    `<div class="bp-pieces theme-skin-${pick('skin')} theme-ball-${pick('ball')}">
+        <div class="token team-A kind-queen carrier">${pieceSvg('queen')}<span class="ball">${BALL_SVG}</span></div>
+        <div class="token team-B kind-knight">${pieceSvg('knight')}</div>
+      </div>`,
+  );
 }
 
 function shopCard(w: Wallet, it: ShopItem): string {
@@ -603,12 +644,49 @@ function shopCard(w: Wallet, it: ShopItem): string {
   else button = `<button class="btn small" disabled><span aria-hidden="true">🔒</span> ${esc(t('shop.need', { n: price }))}</button>`;
   const tag = on ? 'equipped' : has ? 'owned' : 'locked';
   const tagText = on ? t('shop.equipped') : has ? (price === 0 ? t('shop.free') : t('shop.owned')) : '';
+  const animated = it.kind === 'floor' && ANIMATED_FLOORS.has(it.id) ? `<span class="fx-tag">${emoji('✨')}${esc(t('shop.animated'))}</span>` : '';
+  const preview = it.kind === 'floor' ? floorPreview(it.id) : it.kind === 'skin' ? skinPreview(it.id) : ballPreview(it.id);
   return `
     <article class="shop-item ${tag}" aria-label="${esc(name)}">
-      ${it.kind === 'floor' ? floorPreview(it.id) : skinPreview(it.id)}
+      ${preview}
       <div class="shop-info">
         <div class="shop-name"><strong>${esc(name)}</strong>${tagText ? `<span class="shop-tag">${esc(tagText)}</span>` : `<span class="price">${coinIcon()}<span dir="ltr">${price}</span></span>`}</div>
+        ${animated}
         <p class="muted small">${esc(t(`${it.kind}.${it.id}.desc` as MessageKey))}</p>
+      </div>
+      ${button}
+    </article>`;
+}
+
+function bundleCard(w: Wallet, b: Bundle): string {
+  const q = bundleQuote(w, b);
+  const name = t(`bundle.${b.id}.name` as MessageKey);
+  const complete = q.missing.length === 0;
+  const worn = b.items.every((i) => equipped(w, i.kind) === i.id);
+  const contents = b.items
+    .map((i) => {
+      const it = findItem(i.kind, i.id)!;
+      const has = owns(w, i.kind, i.id);
+      return `<li class="${has ? 'have' : ''}">${emoji(KIND_EMOJI[i.kind])}<span>${esc(t(`${i.kind}.${i.id}.name` as MessageKey))}</span>
+        <span class="small muted" dir="ltr">${has ? '✓' : priceOf(w, it)}</span></li>`;
+    })
+    .join('');
+  let button: string;
+  if (complete && worn) button = `<button class="btn small equipped-btn" disabled>✓ ${esc(t('shop.equipped'))}</button>`;
+  else if (complete) button = `<button class="btn small" data-act="shop-bundle" data-id="${b.id}">${esc(t('bundle.equipSet'))}</button>`;
+  else if (w.coins >= q.cost)
+    button = `<button class="btn small primary" data-act="shop-bundle" data-id="${b.id}">${esc(t('bundle.buy'))} · ${coinIcon()}<span dir="ltr">${q.cost}</span></button>`;
+  else button = `<button class="btn small" disabled><span aria-hidden="true">🔒</span> ${esc(t('shop.need', { n: q.cost }))}</button>`;
+  const partial = !complete && q.missing.length < b.items.length ? `<p class="small bundle-partial">${esc(t('bundle.partial', { have: b.items.length - q.missing.length, total: b.items.length, n: q.cost }))}</p>` : '';
+  return `
+    <article class="shop-item bundle ${complete ? (worn ? 'equipped' : 'owned') : 'locked'}" aria-label="${esc(name)}">
+      ${bundlePreview(b)}
+      <div class="shop-info">
+        <div class="shop-name"><strong>${emoji('🎁')}${esc(name)}</strong>
+          <span class="price"><s class="muted" dir="ltr">${q.full}</s>${coinIcon()}<span dir="ltr">${q.price}</span></span></div>
+        <span class="save-tag">${esc(t('bundle.save', { n: q.save, pct: Math.round((q.save / Math.max(1, q.full)) * 100) }))}</span>
+        <ul class="bundle-items" aria-label="${esc(t('bundle.contains'))}">${contents}</ul>
+        ${partial}
       </div>
       ${button}
     </article>`;
@@ -617,8 +695,8 @@ function shopCard(w: Wallet, it: ShopItem): string {
 export function renderShop(w: Wallet, cloud = false): string {
   const toNext = MATCHES_PER_BONUS - (w.matches % MATCHES_PER_BONUS);
   const pips = Array.from({ length: MATCHES_PER_BONUS }, (_, i) => `<i class="${i < MATCHES_PER_BONUS - toNext ? 'on' : ''}"></i>`).join('');
-  const section = (kind: 'floor' | 'skin', title: MessageKey) => `
-      <h2 class="section-label">${esc(t(title))}</h2>
+  const section = (kind: ItemKind, title: MessageKey) => `
+      <h2 class="section-label">${emoji(KIND_EMOJI[kind])}${esc(t(title))}</h2>
       <div class="shop-grid">${SHOP_ITEMS.filter((i) => i.kind === kind).map((i) => shopCard(w, i)).join('')}</div>`;
   return `
     <main class="page shop screen-enter">
@@ -630,8 +708,12 @@ export function renderShop(w: Wallet, cloud = false): string {
           <div class="bonus-meter" aria-label="${esc(t('shop.nextBonus', { n: toNext }))}"><span class="pips">${pips}</span><span class="small muted">${esc(t('shop.nextBonus', { n: toNext }))}</span></div>
         </div>
       </section>
+      <h2 class="section-label">${emoji('🎁')}${esc(t('shop.bundles'))}</h2>
+      <p class="muted small section-note">${esc(t('shop.bundlesNote'))}</p>
+      <div class="shop-grid bundles">${BUNDLES.map((b) => bundleCard(w, b)).join('')}</div>
       ${section('floor', 'shop.floors')}
       ${section('skin', 'shop.skins')}
+      ${section('ball', 'shop.balls')}
       <p class="fine">${esc(t(cloud ? 'shop.noteCloud' : 'shop.note'))}</p>
     </main>`;
 }

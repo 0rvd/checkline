@@ -31,14 +31,46 @@
   };
   const profileJson = (p, own) => ({ ...p, ...rankJson(p.rankPoints ?? 0), ...(own ? { email: session?.email ?? null } : {}) });
   // ---- wallets (mirrors public.cl_users and its functions in supabase/setup.sql)
-  const PRICES = { 'floor:classic': 0, 'floor:midnight': 10, 'floor:sunset': 15, 'floor:neon': 20, 'skin:classic': 0, 'skin:obsidian': 10, 'skin:neon': 15, 'skin:gold': 25 };
+  const PRICES = {
+    'floor:classic': 0, 'floor:midnight': 10, 'floor:sunset': 15, 'floor:neon': 20, 'floor:aurora': 35, 'floor:synthwave': 45, 'floor:galaxy': 60, 'floor:prism': 80,
+    'skin:classic': 0, 'skin:obsidian': 10, 'skin:neon': 15, 'skin:gold': 25,
+    'ball:classic': 0, 'ball:ember': 12, 'ball:frost': 15, 'ball:neon': 18, 'ball:cosmic': 30, 'ball:gold': 35,
+  };
+  const BUNDLES = {
+    neon_nights: { price: 55, items: ['floor:synthwave', 'skin:neon', 'ball:neon'] },
+    cosmic: { price: 70, items: ['floor:galaxy', 'skin:obsidian', 'ball:cosmic'] },
+    champion: { price: 99, items: ['floor:prism', 'skin:gold', 'ball:gold'] },
+  };
+  // Turn clock (same as checkline_private.turn_deadline): 25 s + 3 s grace.
+  const DEADLINE_MS = 28000;
+  const expired = (m) => m.status === 'active' && Date.now() - Date.parse(m.turnStartedAt) >= DEADLINE_MS;
+  async function expireTurn(m) {
+    if (!expired(m)) return false;
+    const R = await rules();
+    const W = await wire();
+    const state = W.fromWire(m.state);
+    const r = R.applyAction(state, { type: 'endTurn' });
+    m.state = W.toWire(r.state);
+    m.version++;
+    m.lastAction = { type: 'endTurn', timeout: true };
+    m.lastEvents = r.events;
+    m.lastActor = state.turn === 'A' ? m.a : m.b;
+    m.turnStartedAt = iso();
+    window.__fake.expiries = (window.__fake.expiries ?? 0) + 1;
+    return true;
+  }
   const wallets = new Map();
   const paid = new Set();
   const walletOf = (id) => {
-    if (!wallets.has(id)) wallets.set(id, { coins: 0, matches: 0, wins: 0, owned: ['floor:classic', 'skin:classic'], floor: 'classic', skin: 'classic' });
+    if (!wallets.has(id)) wallets.set(id, { coins: 0, matches: 0, wins: 0, owned: ['floor:classic', 'skin:classic', 'ball:classic'], floor: 'classic', skin: 'classic', ball: 'classic' });
     return wallets.get(id);
   };
-  const wjson = (id) => { const w = walletOf(id); return { ...w, owned: [...w.owned], prices: { ...PRICES } }; };
+  const wjson = (id) => {
+    const w = walletOf(id);
+    const prices = { ...PRICES };
+    for (const [bid, b] of Object.entries(BUNDLES)) prices[`bundle:${bid}`] = b.price;
+    return { ...w, owned: [...w.owned], prices };
+  };
   // Online results only (scored with the result, like checkline_private.finalize_match).
   const payMatch = (id, key, won, played) => {
     if (paid.has(`${id}|${key}`)) return 0;
@@ -214,6 +246,19 @@
       w[kind] = id;
       return wjson(ME());
     },
+    async buyBundle(id) {
+      await delay(cfg.latency / 2);
+      const b = BUNDLES[id];
+      if (!b) throw err('unknown_item');
+      const w = walletOf(ME());
+      const missing = b.items.filter((i) => !w.owned.includes(i));
+      const cost = missing.length ? Math.min(b.price, missing.reduce((n, i) => n + PRICES[i], 0)) : 0;
+      if (w.coins < cost) throw err('too_poor');
+      w.coins -= cost;
+      w.owned.push(...missing);
+      for (const i of b.items) { const [k, v] = i.split(':'); w[k] = v; }
+      return wjson(ME());
+    },
     async myProfile() { await delay(cfg.latency / 2); return session && profiles.get(ME()) ? profileJson(profiles.get(ME()), true) : null; },
     async createMatch(isPublic) {
       await delay(cfg.latency);
@@ -232,7 +277,13 @@
       notify(m);
       return view(m);
     },
-    async getMatch(id) { await delay(cfg.latency / 2); const m = matches.get(id); if (!m) throw err('match_not_found'); return view(m); },
+    async getMatch(id) {
+      await delay(cfg.latency / 2);
+      const m = matches.get(id);
+      if (!m) throw err('match_not_found');
+      if (await expireTurn(m)) setTimeout(() => notify(m), 10);
+      return view(m);
+    },
     async listOpenMatches() {
       await delay(cfg.latency);
       if (cfg.lobbyError) throw new Error('Failed to fetch');
@@ -244,6 +295,7 @@
       const m = matches.get(id);
       if (m.status !== 'active') throw err('match_not_active');
       if (v !== m.version) throw err('stale_state');
+      if (expired(m)) throw err('turn_expired');
       await apply(m, ME(), action);
       setTimeout(() => notify(m), 10);
       return view(m);
@@ -259,22 +311,13 @@
       notify(m);
       return view(m);
     },
-    async claimTimeout(id) {
+    async claimTimeout(id, v) {
       await delay(cfg.latency);
       const m = matches.get(id);
-      const R = await rules();
-      const W = await wire();
-      const state = W.fromWire(m.state);
-      const myTeam = m.a === ME() ? 'A' : 'B';
-      if (state.turn === myTeam) throw err('not_your_turn');
-      if (Date.now() - Date.parse(m.turnStartedAt) < 90000) throw err('turn_time_left');
-      const r = R.applyAction(state, { type: 'endTurn' });
-      m.state = W.toWire(r.state);
-      m.version++;
-      m.lastAction = { type: 'endTurn' };
-      m.lastEvents = r.events;
-      m.lastActor = ME();
-      m.turnStartedAt = iso();
+      if (m.status !== 'active') throw err('match_not_active');
+      if (v !== m.version) throw err('stale_state');
+      if (!(await expireTurn(m))) throw err('turn_time_left');
+      window.__fake.claims = (window.__fake.claims ?? 0) + 1;
       notify(m);
       return view(m);
     },

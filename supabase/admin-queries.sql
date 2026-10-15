@@ -68,7 +68,8 @@ order by r.created_at desc;
 -- select public.cl_admin_adjust_coins('ORVD', 100, 'Tournament prize');
 -- select public.cl_admin_adjust_coins('player@example.com', -20, 'Correction');
 
--- 9. Give an item for free (CHANGES DATA). Items: floor midnight / sunset / neon, skin obsidian / neon / gold.
+-- 9. Give an item for free (CHANGES DATA). Items: floor midnight / sunset / neon / aurora / synthwave / galaxy / prism,
+--    skin obsidian / neon / gold, ball ember / frost / neon / cosmic / gold.
 -- insert into public.user_cosmetics (user_id, kind, item_id, source)
 -- select id, 'skin', 'gold', 'admin' from public."user" where lower(username) = lower('ORVD')
 -- on conflict do nothing;

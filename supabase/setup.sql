@@ -7,12 +7,14 @@
 --   public."user"              one row per player: username, email (private), coins, equipped
 --                              skin and pitch floor, C-rank points, Elo rating and record
 --   public.rank_tiers          C5 ... C1 and the points each tier starts at
---   public.cosmetics           the shop catalogue (pitch floors and piece skins, with prices)
+--   public.cosmetics           the shop catalogue (pitch floors, piece skins and balls, with prices)
+--   public.bundles             full sets (one floor + one skin + one ball) sold for less
+--   public.bundle_items        what each set contains
 --   public.user_cosmetics      what each player owns (inventory)
 --   public.coin_transactions   every coin change: match rewards, purchases, admin grants/removals,
 --                              hand edits in the Table Editor (audit trail)
 --   public.cl_matches          online matches (the two participants, invite code, public-lobby
---                              flag, status, authoritative game state, turn timer)
+--                              flag, status, authoritative game state, 25-second turn clock)
 --   public.cl_match_moves      every accepted action in a match
 --   public.cl_match_results    one row per finished match: score, Elo and C-rank changes, coins
 --   checkline_private.*        server copy of the game rules + internal helpers (not exposed)
@@ -63,6 +65,7 @@ create table if not exists public."user" (
   coins integer not null default 0 check (coins >= 0),
   equipped_skin text not null default 'classic',
   equipped_floor text not null default 'classic',
+  equipped_ball text not null default 'classic',
   rank_points integer not null default 0 check (rank_points >= 0),    -- C-rank ladder (C5..C1)
   rating integer not null default 1200,                               -- Elo (leaderboard order)
   wins integer not null default 0 check (wins >= 0),
@@ -89,6 +92,7 @@ alter table public."user" add column if not exists is_guest boolean not null def
 alter table public."user" add column if not exists coins integer not null default 0 check (coins >= 0);
 alter table public."user" add column if not exists equipped_skin text not null default 'classic';
 alter table public."user" add column if not exists equipped_floor text not null default 'classic';
+alter table public."user" add column if not exists equipped_ball text not null default 'classic';
 alter table public."user" add column if not exists rank_points integer not null default 0 check (rank_points >= 0);
 alter table public."user" add column if not exists ranked_games integer not null default 0 check (ranked_games >= 0);
 alter table public."user" add column if not exists rank_updated_at timestamptz;
@@ -230,29 +234,63 @@ create index if not exists cl_match_results_created_idx on public.cl_match_resul
 
 -- 1.4 Shop catalogue and inventory.
 create table if not exists public.cosmetics (
-  kind text not null check (kind in ('floor', 'skin')),
+  kind text not null,
   id text not null check (id ~ '^[a-z0-9_-]{2,24}$'),
   price integer not null check (price >= 0),
   sort smallint not null default 0,
   active boolean not null default true,
   primary key (kind, id)
 );
--- Starting catalogue (prices match src/ui/economy.ts). Re-running keeps prices you changed.
+-- v0.5: balls are a third, independent category.
+alter table public.cosmetics drop constraint if exists cosmetics_kind_check;
+alter table public.cosmetics add constraint cosmetics_kind_check check (kind in ('floor', 'skin', 'ball'));
+-- Catalogue (prices match src/ui/economy.ts). Re-running adds new items and keeps prices you changed.
+-- Animated floors (aurora, synthwave, galaxy, prism) cost more, in step with how elaborate they are.
 insert into public.cosmetics (kind, id, price, sort) values
   ('floor', 'classic', 0, 0), ('floor', 'midnight', 10, 1), ('floor', 'sunset', 15, 2), ('floor', 'neon', 20, 3),
-  ('skin', 'classic', 0, 0), ('skin', 'obsidian', 10, 1), ('skin', 'neon', 15, 2), ('skin', 'gold', 25, 3)
+  ('floor', 'aurora', 35, 4), ('floor', 'synthwave', 45, 5), ('floor', 'galaxy', 60, 6), ('floor', 'prism', 80, 7),
+  ('skin', 'classic', 0, 0), ('skin', 'obsidian', 10, 1), ('skin', 'neon', 15, 2), ('skin', 'gold', 25, 3),
+  ('ball', 'classic', 0, 0), ('ball', 'ember', 12, 1), ('ball', 'frost', 15, 2), ('ball', 'neon', 18, 3),
+  ('ball', 'cosmic', 30, 4), ('ball', 'gold', 35, 5)
 on conflict (kind, id) do nothing;
+
+-- Full sets: one floor + one skin + one ball for less than the three separately.
+create table if not exists public.bundles (
+  id text primary key check (id ~ '^[a-z0-9_-]{2,24}$'),
+  price integer not null check (price >= 0),
+  sort smallint not null default 0,
+  active boolean not null default true
+);
+create table if not exists public.bundle_items (
+  bundle_id text not null references public.bundles (id) on delete cascade on update cascade,
+  kind text not null check (kind in ('floor', 'skin', 'ball')),
+  item_id text not null,
+  primary key (bundle_id, kind),
+  foreign key (kind, item_id) references public.cosmetics (kind, id) on update cascade
+);
+comment on table public.bundles is 'Full sets. Price must stay below the sum of the three items (checked when bought: never more than the missing items cost).';
+insert into public.bundles (id, price, sort) values ('neon_nights', 55, 1), ('cosmic', 70, 2), ('champion', 99, 3)
+on conflict (id) do nothing;
+insert into public.bundle_items (bundle_id, kind, item_id) values
+  ('neon_nights', 'floor', 'synthwave'), ('neon_nights', 'skin', 'neon'), ('neon_nights', 'ball', 'neon'),
+  ('cosmic', 'floor', 'galaxy'), ('cosmic', 'skin', 'obsidian'), ('cosmic', 'ball', 'cosmic'),
+  ('champion', 'floor', 'prism'), ('champion', 'skin', 'gold'), ('champion', 'ball', 'gold')
+on conflict (bundle_id, kind) do nothing;
 
 create table if not exists public.user_cosmetics (
   user_id uuid not null references public."user" (id) on delete cascade,
   kind text not null,
   item_id text not null,
-  source text not null default 'purchase' check (source in ('starter', 'purchase', 'admin', 'migration')),
+  source text not null default 'purchase',
   price_paid integer not null default 0 check (price_paid >= 0),
   acquired_at timestamptz not null default now(),
   primary key (user_id, kind, item_id),
   foreign key (kind, item_id) references public.cosmetics (kind, id) on update cascade
 );
+
+alter table public.user_cosmetics drop constraint if exists user_cosmetics_source_check;
+alter table public.user_cosmetics add constraint user_cosmetics_source_check
+  check (source in ('starter', 'purchase', 'bundle', 'admin', 'migration'));
 
 -- 1.5 Coin history. Every change to public."user".coins writes one row here.
 create table if not exists public.coin_transactions (
@@ -956,6 +994,36 @@ begin
 end
 $$;
 
+-- Turn clock: every online turn lasts 25 seconds (src/online/backend.ts TURN_SECONDS), plus
+-- 3 seconds of grace for network delay and the move animation (TURN_GRACE_SECONDS). The
+-- deadline is counted from turn_started_at, which is reset only when a new turn begins
+-- (commit_action), never by an action inside the turn, and always with the server's clock.
+create or replace function checkline_private.turn_deadline(p_m public.cl_matches)
+returns timestamptz language sql stable set search_path = '' as $$
+  select coalesce(p_m.turn_started_at, p_m.started_at, p_m.updated_at) + interval '28 seconds'
+$$;
+
+-- End the current turn of a locked, active match if its deadline has passed (exactly what
+-- End turn does: unused AP are lost). Returns the match unchanged otherwise, so calling it
+-- twice, or from two places at once (the row is locked), ends a turn only once.
+create or replace function checkline_private.expire_turn(p_m public.cl_matches)
+returns public.cl_matches language plpgsql set search_path = '' as $$
+declare
+  v_idle text := p_m.state ->> 'turn';
+  v_action jsonb := jsonb_build_object('type', 'endTurn', 'timeout', true);
+  v_res jsonb;
+begin
+  if p_m.status <> 'active' or p_m.rules_version <> 3 or p_m.state is null
+     or now() < checkline_private.turn_deadline(p_m) then
+    return p_m;
+  end if;
+  v_res := checkline_private.apply_action(p_m.state, v_action);
+  if not (v_res ->> 'ok')::boolean then return p_m; end if;
+  return checkline_private.commit_action(p_m, case when v_idle = 'A' then p_m.player_a else p_m.player_b end,
+                                         v_idle, v_action, v_res, false);
+end
+$$;
+
 -- Lock a match row and check the caller takes part in it.
 create or replace function checkline_private.lock_my_match(p_match_id uuid, p_uid uuid)
 returns public.cl_matches language plpgsql set search_path = '' as $$
@@ -1010,11 +1078,13 @@ create or replace function checkline_private.wallet_json(p_uid uuid)
 returns jsonb language sql stable set search_path = '' as $$
   select jsonb_build_object(
     'coins', u.coins, 'matches', u.games, 'wins', u.wins,
-    'floor', u.equipped_floor, 'skin', u.equipped_skin,
+    'floor', u.equipped_floor, 'skin', u.equipped_skin, 'ball', u.equipped_ball,
     'owned', coalesce((select jsonb_agg(c.kind || ':' || c.item_id order by c.kind, c.item_id)
                        from public.user_cosmetics c where c.user_id = u.id), '[]'::jsonb),
     'prices', coalesce((select jsonb_object_agg(k.kind || ':' || k.id, k.price)
-                        from public.cosmetics k where k.active), '{}'::jsonb))
+                        from public.cosmetics k where k.active), '{}'::jsonb)
+              || coalesce((select jsonb_object_agg('bundle:' || b.id, b.price)
+                           from public.bundles b where b.active), '{}'::jsonb))
   from public."user" u where u.id = p_uid
 $$;
 
@@ -1121,8 +1191,10 @@ begin
 end
 $$;
 
+-- Also ends a turn whose deadline has passed, so a player who reconnects (or whose opponent
+-- left) always sees the same, up-to-date match.
 create or replace function public.cl_get_match(p_match_id uuid)
-returns jsonb language plpgsql stable security definer set search_path = '' as $$
+returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
   v_uid uuid := checkline_private.require_uid();
   v_m public.cl_matches;
@@ -1131,6 +1203,9 @@ begin
   if not found or not (v_uid in (v_m.player_a, coalesce(v_m.player_b, v_m.player_a))
                        or (v_m.status = 'waiting' and v_m.is_public)) then
     raise exception 'CL:match_not_found';
+  end if;
+  if v_m.status = 'active' and now() >= checkline_private.turn_deadline(v_m) then
+    v_m := checkline_private.expire_turn(checkline_private.lock_my_match(p_match_id, v_uid));
   end if;
   return checkline_private.match_view(v_m);
 end
@@ -1154,7 +1229,8 @@ returns jsonb language sql stable security definer set search_path = '' as $$
 $$;
 
 -- Submit one game action. Checks: participant, active match, current rules, expected version
--- (no overwrites), caller's turn, and full rule validation. Finishes and rates the match.
+-- (no overwrites), caller's turn, the turn deadline (server clock: an action cannot extend a
+-- turn), and full rule validation. Finishes and rates the match.
 create or replace function public.cl_submit_action(p_match_id uuid, p_expected_version integer, p_action jsonb)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
@@ -1169,6 +1245,7 @@ begin
   if p_expected_version is distinct from v_m.version then raise exception 'CL:stale_state'; end if;
   v_team := case when v_uid = v_m.player_a then 'A' else 'B' end;
   if v_m.state ->> 'turn' <> v_team then raise exception 'CL:not_your_turn'; end if;
+  if now() >= checkline_private.turn_deadline(v_m) then raise exception 'CL:turn_expired'; end if;
   if jsonb_typeof(p_action) is distinct from 'object' or pg_column_size(p_action) > 1024 then
     raise exception 'CL:bad_action';
   end if;
@@ -1181,29 +1258,24 @@ begin
 end
 $$;
 
--- Turn timer: when the side to move has used more than 90 seconds, its opponent may end that
--- turn for it. The server checks the clock; unused AP are lost as with a normal End Turn.
-create or replace function public.cl_claim_timeout(p_match_id uuid)
+-- Turn clock: once the current turn's deadline (25 s + 3 s grace) has passed, either player
+-- may ask the server to end it; the game does this automatically. p_expected_version must be
+-- the match version the caller saw, so a repeated or late request can never end a second turn
+-- (it gets CL:stale_state). Before the deadline: CL:turn_time_left.
+drop function if exists public.cl_claim_timeout(uuid);
+create or replace function public.cl_claim_timeout(p_match_id uuid, p_expected_version integer)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
   v_uid uuid := checkline_private.require_uid();
   v_m public.cl_matches;
-  v_idle_team text;
-  v_res jsonb;
-  v_action jsonb := jsonb_build_object('type', 'endTurn', 'timeout', true);
+  v_version integer;
 begin
   v_m := checkline_private.lock_my_match(p_match_id, v_uid);
   if v_m.status <> 'active' or v_m.rules_version <> 3 then raise exception 'CL:match_not_active'; end if;
-  v_idle_team := v_m.state ->> 'turn';
-  if (v_idle_team = 'A' and v_uid = v_m.player_a) or (v_idle_team = 'B' and v_uid = v_m.player_b) then
-    raise exception 'CL:not_your_turn';
-  end if;
-  if v_m.turn_started_at is not null and v_m.turn_started_at > now() - interval '90 seconds' then
-    raise exception 'CL:turn_time_left';
-  end if;
-  v_res := checkline_private.apply_action(v_m.state, v_action);
-  v_m := checkline_private.commit_action(v_m, case when v_idle_team = 'A' then v_m.player_a else v_m.player_b end,
-                                         v_idle_team, v_action, v_res, false);
+  if p_expected_version is distinct from v_m.version then raise exception 'CL:stale_state'; end if;
+  v_version := v_m.version;
+  v_m := checkline_private.expire_turn(v_m);
+  if v_m.version = v_version then raise exception 'CL:turn_time_left'; end if;
   return checkline_private.match_view(v_m);
 end
 $$;
@@ -1215,7 +1287,7 @@ declare
   v_uid uuid := checkline_private.require_uid();
   v_m public.cl_matches;
 begin
-  v_m := checkline_private.lock_my_match(p_match_id, v_uid);
+  v_m := checkline_private.expire_turn(checkline_private.lock_my_match(p_match_id, v_uid));
   if v_m.status in ('waiting', 'active') then
     update public.cl_matches set
       a_seen_at = case when v_uid = player_a then now() else a_seen_at end,
@@ -1315,7 +1387,7 @@ begin
 end
 $$;
 
--- Buy (if not owned yet) and equip a floor or skin. One transaction: the price is read from
+-- Buy (if not owned yet) and equip a floor, skin or ball. One transaction: the price is read from
 -- public.cosmetics, coins are taken with a ledger row, the item is added and equipped.
 -- Not enough coins -> CL:too_poor and nothing changes.
 create or replace function public.cl_buy_item(p_kind text, p_id text)
@@ -1338,8 +1410,51 @@ begin
   end if;
   update public."user" set
     equipped_floor = case when p_kind = 'floor' then p_id else equipped_floor end,
-    equipped_skin = case when p_kind = 'skin' then p_id else equipped_skin end
+    equipped_skin = case when p_kind = 'skin' then p_id else equipped_skin end,
+    equipped_ball = case when p_kind = 'ball' then p_id else equipped_ball end
   where id = v_uid;
+  return checkline_private.wallet_json(v_uid);
+end
+$$;
+
+-- Buy (if needed) and equip a full set. One transaction, all or nothing:
+--   * the price comes from public.bundles; a player who already owns some of the items pays
+--     the lower of the set price and what the missing items cost one by one (never more);
+--   * owning the whole set already costs nothing (the set is just equipped);
+--   * not enough coins -> CL:too_poor and nothing changes;
+--   * one coin_transactions row (kind 'purchase', item 'bundle:<id>'), the missing items are
+--     added to user_cosmetics (source 'bundle') and all three are equipped.
+create or replace function public.cl_buy_bundle(p_id text)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_uid uuid := checkline_private.require_uid();
+  v_bundle public.bundles;
+  v_missing_sum integer;
+  v_missing integer;
+  v_cost integer;
+begin
+  if not exists (select 1 from public."user" where id = v_uid) then raise exception 'CL:profile_required'; end if;
+  perform 1 from public."user" where id = v_uid for update;
+  select * into v_bundle from public.bundles where id = p_id and active;
+  if not found or (select count(*) from public.bundle_items where bundle_id = p_id) = 0 then raise exception 'CL:unknown_item'; end if;
+  select coalesce(sum(c.price), 0), count(*) into v_missing_sum, v_missing
+  from public.bundle_items i
+  join public.cosmetics c on c.kind = i.kind and c.id = i.item_id
+  where i.bundle_id = p_id
+    and not exists (select 1 from public.user_cosmetics o where o.user_id = v_uid and o.kind = i.kind and o.item_id = i.item_id);
+  v_cost := case when v_missing = 0 then 0 else least(v_bundle.price, v_missing_sum) end;
+  if v_cost > 0 then
+    perform checkline_private.change_coins(v_uid, -v_cost, 'purchase', null, 'bundle:' || p_id,
+      (select string_agg(i.kind || ':' || i.item_id, ', ' order by i.kind) from public.bundle_items i where i.bundle_id = p_id), 'player');
+  end if;
+  insert into public.user_cosmetics (user_id, kind, item_id, source, price_paid)
+  select v_uid, i.kind, i.item_id, 'bundle', 0 from public.bundle_items i where i.bundle_id = p_id
+  on conflict do nothing;
+  update public."user" u set
+    equipped_floor = coalesce((select i.item_id from public.bundle_items i where i.bundle_id = p_id and i.kind = 'floor'), u.equipped_floor),
+    equipped_skin = coalesce((select i.item_id from public.bundle_items i where i.bundle_id = p_id and i.kind = 'skin'), u.equipped_skin),
+    equipped_ball = coalesce((select i.item_id from public.bundle_items i where i.bundle_id = p_id and i.kind = 'ball'), u.equipped_ball)
+  where u.id = v_uid;
   return checkline_private.wallet_json(v_uid);
 end
 $$;
@@ -1424,7 +1539,7 @@ drop trigger if exists user_starter_items on public."user";
 create trigger user_starter_items after insert on public."user"
   for each row execute function checkline_private.give_starter_items();
 
--- Equipped floor / skin must be owned (Classic is always allowed). Also stamps updated_at.
+-- Equipped floor / skin / ball must be owned (Classic is always allowed). Also stamps updated_at.
 create or replace function checkline_private.check_user_row()
 returns trigger language plpgsql security definer set search_path = '' as $$
 begin
@@ -1435,6 +1550,10 @@ begin
   if new.equipped_skin <> 'classic' and not exists (
        select 1 from public.user_cosmetics c where c.user_id = new.id and c.kind = 'skin' and c.item_id = new.equipped_skin) then
     raise exception 'CL:not_owned' using detail = 'Give the player that skin in public.user_cosmetics first.';
+  end if;
+  if new.equipped_ball <> 'classic' and not exists (
+       select 1 from public.user_cosmetics c where c.user_id = new.id and c.kind = 'ball' and c.item_id = new.equipped_ball) then
+    raise exception 'CL:not_owned' using detail = 'Give the player that ball in public.user_cosmetics first.';
   end if;
   new.updated_at := now();
   return new;
@@ -1580,6 +1699,8 @@ drop function if exists checkline_private.touch_updated_at();
 alter table public."user" enable row level security;
 alter table public.rank_tiers enable row level security;
 alter table public.cosmetics enable row level security;
+alter table public.bundles enable row level security;
+alter table public.bundle_items enable row level security;
 alter table public.user_cosmetics enable row level security;
 alter table public.coin_transactions enable row level security;
 alter table public.cl_matches enable row level security;
@@ -1587,10 +1708,10 @@ alter table public.cl_match_moves enable row level security;
 alter table public.cl_match_results enable row level security;
 
 -- Tables are read-only for players; every change goes through the functions above.
-revoke all on table public."user", public.rank_tiers, public.cosmetics, public.user_cosmetics,
+revoke all on table public."user", public.rank_tiers, public.cosmetics, public.bundles, public.bundle_items, public.user_cosmetics,
   public.coin_transactions, public.cl_matches, public.cl_match_moves, public.cl_match_results
   from public, anon, authenticated;
-grant select on table public.rank_tiers, public.cosmetics to anon, authenticated;
+grant select on table public.rank_tiers, public.cosmetics, public.bundles, public.bundle_items to anon, authenticated;
 grant select on table public."user", public.user_cosmetics, public.coin_transactions,
   public.cl_matches, public.cl_match_moves, public.cl_match_results to authenticated;
 
@@ -1606,6 +1727,11 @@ create policy "rank_tiers_read_all" on public.rank_tiers for select to anon, aut
 
 drop policy if exists "cosmetics_read_all" on public.cosmetics;
 create policy "cosmetics_read_all" on public.cosmetics for select to anon, authenticated using (true);
+
+drop policy if exists "bundles_read_all" on public.bundles;
+create policy "bundles_read_all" on public.bundles for select to anon, authenticated using (true);
+drop policy if exists "bundle_items_read_all" on public.bundle_items;
+create policy "bundle_items_read_all" on public.bundle_items for select to anon, authenticated using (true);
 
 drop policy if exists "user_cosmetics_read_own" on public.user_cosmetics;
 create policy "user_cosmetics_read_own" on public.user_cosmetics
@@ -1642,9 +1768,9 @@ begin
   foreach v_fn in array array[
     'public.cl_upsert_profile(text)', 'public.cl_get_my_profile()', 'public.cl_create_match(boolean)',
     'public.cl_join_match(text)', 'public.cl_get_match(uuid)', 'public.cl_list_open_matches()',
-    'public.cl_list_my_matches()', 'public.cl_submit_action(uuid, integer, jsonb)', 'public.cl_claim_timeout(uuid)',
+    'public.cl_list_my_matches()', 'public.cl_submit_action(uuid, integer, jsonb)', 'public.cl_claim_timeout(uuid, integer)',
     'public.cl_touch_match(uuid)', 'public.cl_resign(uuid)', 'public.cl_claim_forfeit(uuid)',
-    'public.cl_cancel_match(uuid)', 'public.cl_get_wallet()', 'public.cl_buy_item(text, text)'] loop
+    'public.cl_cancel_match(uuid)', 'public.cl_get_wallet()', 'public.cl_buy_item(text, text)', 'public.cl_buy_bundle(text)'] loop
     execute format('revoke all on function %s from public, anon', v_fn);
     execute format('grant execute on function %s to authenticated', v_fn);
   end loop;

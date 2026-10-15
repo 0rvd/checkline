@@ -35,17 +35,23 @@ export const SVG_DEFS = `<svg width="0" height="0" style="position:absolute" ari
   <linearGradient id="cl-fig-light" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff9ec"/><stop offset=".6" stop-color="#efe3c8"/><stop offset="1" stop-color="#cdb98f"/></linearGradient>
   <linearGradient id="cl-fig-gold" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff1c2"/><stop offset=".55" stop-color="#e2b45a"/><stop offset="1" stop-color="#9a6e22"/></linearGradient>
   <radialGradient id="cl-ball" cx=".35" cy=".3" r=".8"><stop offset="0" stop-color="#fff"/><stop offset=".7" stop-color="#e9e9e9"/><stop offset="1" stop-color="#9a9a9a"/></radialGradient>
+  <radialGradient id="cl-ball-ember" cx=".35" cy=".3" r=".85"><stop offset="0" stop-color="#fff2c4"/><stop offset=".45" stop-color="#ff9a3c"/><stop offset="1" stop-color="#a3260f"/></radialGradient>
+  <radialGradient id="cl-ball-frost" cx=".35" cy=".3" r=".85"><stop offset="0" stop-color="#ffffff"/><stop offset=".55" stop-color="#cdeeff"/><stop offset="1" stop-color="#5d9fd0"/></radialGradient>
+  <radialGradient id="cl-ball-neon" cx=".35" cy=".3" r=".85"><stop offset="0" stop-color="#2a1748"/><stop offset=".7" stop-color="#120a26"/><stop offset="1" stop-color="#05030d"/></radialGradient>
+  <radialGradient id="cl-ball-cosmic" cx=".35" cy=".3" r=".9"><stop offset="0" stop-color="#c9b6ff"/><stop offset=".35" stop-color="#6a4bd8"/><stop offset=".75" stop-color="#22145c"/><stop offset="1" stop-color="#0b0726"/></radialGradient>
+  <radialGradient id="cl-ball-gold" cx=".35" cy=".3" r=".85"><stop offset="0" stop-color="#fff6d6"/><stop offset=".5" stop-color="#e8b84e"/><stop offset="1" stop-color="#8a5f17"/></radialGradient>
 </defs></svg>`;
 
 export function pieceSvg(kind: PieceKind): string {
   return `<svg class="figure" viewBox="0 0 100 100" aria-hidden="true">${SHAPES[kind]}${BASE}</svg>`;
 }
 
+/** The ball. Its parts have classes so ball skins (styles.css, :root[data-ball]) can recolour it. */
 export const BALL_SVG =
   '<svg class="ball-icon" viewBox="0 0 24 24" aria-hidden="true">' +
-  '<circle cx="12" cy="12" r="10.5" fill="url(#cl-ball)" stroke="#111" stroke-width="1.3"/>' +
-  '<path d="M12 7.2 L16.4 10.4 L14.7 15.6 H9.3 L7.6 10.4 Z" fill="#141414"/>' +
-  '<path d="M12 7.2 V2 M16.4 10.4 L21.6 8.8 M14.7 15.6 L18 20 M9.3 15.6 L6 20 M7.6 10.4 L2.4 8.8" stroke="#141414" stroke-width="1.2"/>' +
+  '<circle class="ball-body" cx="12" cy="12" r="10.5" fill="url(#cl-ball)" stroke="#111" stroke-width="1.3"/>' +
+  '<g class="ball-panels"><path class="ball-patch" d="M12 7.2 L16.4 10.4 L14.7 15.6 H9.3 L7.6 10.4 Z" fill="#141414"/>' +
+  '<path class="ball-seam" d="M12 7.2 V2 M16.4 10.4 L21.6 8.8 M14.7 15.6 L18 20 M9.3 15.6 L6 20 M7.6 10.4 L2.4 8.8" stroke="#141414" stroke-width="1.2"/></g>' +
   '</svg>';
 
 /** Tiny movement diagram: 7x7 grid, piece in the centre, reachable squares dotted, pawn tackles crossed. */

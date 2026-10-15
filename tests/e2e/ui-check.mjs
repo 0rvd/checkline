@@ -35,6 +35,9 @@ async function newPage(opts = {}) {
   const ctx = await browser.newContext({ viewport: opts.viewport ?? { width: 1280, height: 860 }, deviceScaleFactor: 1 });
   if (opts.lang) await ctx.addInitScript((l) => localStorage.getItem('checkline.lang') || localStorage.setItem('checkline.lang', l), opts.lang);
   if (opts.reduceMotion) await ctx.addInitScript(() => localStorage.setItem('checkline.settings.v2', JSON.stringify({ reduceMotion: true })));
+  // Scripted matches play their turns fast but must never be cut short by the 25 s turn clock;
+  // the clock checks below set short turns on purpose.
+  await ctx.addInitScript((n) => (window.__CHECKLINE_TURN_SECONDS__ = n), opts.turnSeconds ?? 600);
   if (opts.fake) {
     await ctx.addInitScript((c) => (window.__fakeCfg = c), opts.fakeCfg ?? {});
     await ctx.addInitScript(fakeBackend);
@@ -218,6 +221,61 @@ for (const [seed, expect] of [[6, 'clock'], [14, 'draw']]) {
   await page.context().close();
 }
 
+// ------------------------------------------------------------------ 3b2. turn clock: local and computer (short turns)
+{
+  const page = await newPage({ lang: 'en', reduceMotion: true, turnSeconds: 3 });
+  await page.click('[data-act="play-local"]');
+  const first = (await page.textContent('.overlay h2')).includes('Team A') ? 'A' : 'B';
+  await page.waitForTimeout(1500);
+  check('clock: paused behind the opening hand-off screen', (await page.evaluate(() => window.__checklineState().turn)) === first);
+  await closeOverlay(page);
+  await page.waitForTimeout(400);
+  check('clock: shown with the turn and highlighted in the last seconds', !!(await page.$('[data-turn-clock].low:not([hidden])')));
+  await page.screenshot({ path: join(SHOTS, 'en-clock-low.png') });
+  await page.waitForFunction((f) => window.__checklineState().turn !== f, first, { timeout: 6000 }).catch(() => {});
+  const st = await page.evaluate(() => window.__checklineState());
+  check('clock: at zero the turn ends and passes to the other player', st.turn !== first && /time ran out/.test(await page.textContent('.log')), st.turn);
+  check('clock: hand-off screen shown to the next player (clock paused)', !!(await page.$('.overlay')));
+  await page.waitForTimeout(3600);
+  check('clock: the hand-off screen pauses the countdown', (await page.evaluate(() => window.__checklineState().turn)) === st.turn);
+  await closeOverlay(page);
+  await page.waitForFunction((f) => window.__checklineState().turn === f, first, { timeout: 6000 }).catch(() => {});
+  check('clock: the next turn gets a fresh countdown and times out too', (await page.evaluate(() => window.__checklineState().turn)) === first);
+  check('no console errors (local clock)', page.errors.length === 0, page.errors.join(' | '));
+  await page.context().close();
+}
+{
+  // An action inside the turn does not reset the clock.
+  const page = await newPage({ lang: 'en', reduceMotion: true, turnSeconds: 8 });
+  await page.click('[data-act="play-local"]');
+  await closeOverlay(page);
+  await page.waitForTimeout(2600);
+  const s0 = fromWire(await page.evaluate(() => window.__checklineState()));
+  const mv = planTurn(s0, { difficulty: 'easy', random: () => 0.3 }).find((a) => a.type === 'move');
+  if (mv) await clickAction(page, s0, mv);
+  await page.waitForTimeout(500);
+  const secs = Number(await page.$eval('[data-turn-clock] b', (e) => e.textContent));
+  check('clock: an action does not reset the turn clock', !!mv && secs <= 6, String(secs));
+  await page.context().close();
+}
+{
+  const page = await newPage({ lang: 'ar', reduceMotion: true, turnSeconds: 3 });
+  await page.click('[data-act="ai-setup"]');
+  await page.click('[data-act="pick-difficulty"][data-value="easy"]');
+  await page.click('[data-act="pick-side"][data-value="A"]');
+  await page.click('[data-act="ai-start"]');
+  await closeOverlay(page);
+  // Wait for my (Ivory) turn, then let the clock run out.
+  await page.waitForFunction(() => window.__checklineState().turn === 'A', null, { timeout: 15000 });
+  const tn = await page.evaluate(() => window.__checklineState().turnNumber);
+  await page.waitForFunction((n) => window.__checklineState().turnNumber > n, tn, { timeout: 8000 }).catch(() => {});
+  const hidden = await page.$eval('[data-turn-clock]', (e) => e.hidden).catch(() => null);
+  check('clock vs computer: my turn times out, then the computer plays (no clock on its turn)', (await page.evaluate((n) => window.__checklineState().turnNumber > n, tn)) && hidden === true);
+  await page.screenshot({ path: join(SHOTS, 'ar-clock-ai.png') });
+  check('no console errors (computer clock)', page.errors.length === 0, page.errors.join(' | '));
+  await page.context().close();
+}
+
 // ------------------------------------------------------------------ 3c. mobile thumb dock (portrait + landscape)
 for (const vp of [{ width: 390, height: 844, tag: 'portrait' }, { width: 844, height: 390, tag: 'landscape' }]) {
   const page = await newPage({ lang: 'en', viewport: vp, reduceMotion: true });
@@ -327,6 +385,61 @@ for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 
   await page.waitForTimeout(300);
   await page.screenshot({ path: join(SHOTS, `${lang}-themed-game-${vp.width}.png`) });
   check(`no console errors shop ${lang}`, page.errors.length === 0, page.errors.join(' | '));
+  await page.context().close();
+}
+
+// ------------------------------------------------------------------ 3f. balls and full sets (EN + AR, desktop + phone)
+for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 390, height: 844 }]]) {
+  const page = await newPage({ lang, viewport: vp });
+  await page.evaluate(() => {
+    localStorage.setItem('checkline.wallet.v1', JSON.stringify({ coins: 90, matches: 0, wins: 0, owned: ['floor:classic', 'skin:classic', 'skin:neon'], floor: 'classic', skin: 'classic', paid: [] }));
+  });
+  await page.reload();
+  await page.click('.mode-card.shop-card');
+  await page.waitForSelector('.shop-grid.bundles');
+  const sections = await page.$$eval('.section-label', (h) => h.length);
+  check(`shop ${lang}: sets, pitches, pieces and balls are separate sections with previews`, sections === 4 &&
+    (await page.$$('.ball-preview')).length === 6 && (await page.$$('.bundle .bp-pieces')).length === 3 && (await page.$$('.fx-tag')).length === 4);
+  const neon = await page.textContent('[aria-label] .save-tag');
+  check(`shop ${lang}: a set shows its saving`, /23/.test(neon) && /29/.test(neon), neon);
+  const partial = await page.textContent('.shop-item.bundle:first-child .bundle-partial').catch(() => '');
+  check(`shop ${lang}: owning part of a set says what is left to pay`, /55/.test(partial ?? '') && /1/.test(partial ?? '') && /3/.test(partial ?? ''), partial);
+  await page.click('[data-act="shop-item"][data-kind="ball"][data-id="ember"]');
+  await page.waitForTimeout(150);
+  check(`shop ${lang}: a ball is bought and equipped on its own`, (await page.evaluate(() => [document.documentElement.dataset.ball, document.documentElement.dataset.floor].join())) === 'ember,classic');
+  await page.click('[data-act="shop-bundle"][data-id="neon_nights"]');
+  await page.waitForTimeout(150);
+  const w = await page.evaluate(() => JSON.parse(localStorage.getItem('checkline.wallet.v1')));
+  check(`shop ${lang}: a set adds all its items at once and equips them`, w.coins === 90 - 12 - 55 && ['floor:synthwave', 'skin:neon', 'ball:neon'].every((x) => w.owned.includes(x)) &&
+    (await page.evaluate(() => [document.documentElement.dataset.floor, document.documentElement.dataset.skin, document.documentElement.dataset.ball].join())) === 'synthwave,neon,neon', JSON.stringify(w));
+  await page.click('[data-act="shop-item"][data-kind="ball"][data-id="ember"]');
+  await page.waitForTimeout(100);
+  check(`shop ${lang}: mix and match after a set (ball switched, floor kept)`, (await page.evaluate(() => [document.documentElement.dataset.floor, document.documentElement.dataset.ball].join())) === 'synthwave,ember');
+  check(`shop ${lang}: an unaffordable set is locked`, !!(await page.$('.shop-item.bundle.locked button[disabled]')));
+  const probs = await layoutProblems(page);
+  check(`layout shop sets ${lang} ${vp.width}`, probs.length === 0, probs.join('; '));
+  await page.screenshot({ path: join(SHOTS, `${lang}-shop-sets-${vp.width}.png`), fullPage: true });
+  await page.click('[data-act="menu"]');
+  await page.click('[data-act="play-local"]');
+  await closeOverlay(page);
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: join(SHOTS, `${lang}-synthwave-game-${vp.width}.png`) });
+  const fx = await page.evaluate(() => getComputedStyle(document.querySelector('.board'), '::after').animationName);
+  check(`animated pitch ${lang}: the synthwave floor animates on the real pitch`, /synthScan/.test(fx), fx);
+  check(`no console errors shop sets ${lang}`, page.errors.length === 0, page.errors.join(' | '));
+  await page.context().close();
+}
+{
+  // Reduced motion (the game setting): animated floors and balls stand still.
+  const page = await newPage({ lang: 'en', reduceMotion: true });
+  await page.evaluate(() => localStorage.setItem('checkline.wallet.v1', JSON.stringify({ coins: 0, matches: 0, wins: 0, owned: ['floor:classic', 'skin:classic', 'ball:classic', 'floor:galaxy', 'ball:cosmic'], floor: 'galaxy', skin: 'classic', ball: 'cosmic', paid: [] })));
+  await page.reload();
+  await page.click('[data-act="play-local"]');
+  await closeOverlay(page);
+  await page.waitForTimeout(300);
+  const d = await page.evaluate(() => getComputedStyle(document.querySelector('.board'), '::after').animationDuration);
+  check('reduced motion: animated pitch floors stand still', /^(1e-06s|0\.000001s|0s)/.test(d), d);
+  await page.screenshot({ path: join(SHOTS, 'en-galaxy-reduced.png') });
   await page.context().close();
 }
 
@@ -543,18 +656,30 @@ for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 
   await page.click(cell({ c: 3, r: 0 }));
   await page.click(cell({ c: 3, r: 2 }));
   check('online: illegal move explained', /out of reach|King/.test((await page.textContent('.toast').catch(() => '')) ?? ''));
-  // Turn timer: after my turn, the opponent idles past 90 s and I end their turn.
+  // Turn clock (server deadline 25 s + 3 s grace). My own turn: the clock is shown and counts down.
+  const clockSecs = async () => Number(await page.$eval('[data-turn-clock]:not([hidden]) b', (e) => e.textContent).catch(() => 'NaN'));
+  const c1 = await clockSecs();
+  check('online: the 25-second turn clock is shown on my turn', c1 > 0 && c1 <= 25 && !(await page.$('[data-turn-clock].theirs')), String(c1));
+  // The opponent idles past the deadline: my game ends their turn automatically.
   await page.keyboard.press('Escape');
   await page.click('[data-act="end"]');
   await page.waitForFunction(() => window.__fake.current().state.turn === 'B', null, { timeout: 4000 });
   await page.waitForTimeout(300);
-  await page.evaluate(() => window.__fake.turnStartedAgo(120));
-  await page.waitForSelector('[data-act="claim-time"]', { timeout: 5000 });
+  check('online: the clock shows the opponent turn too', !!(await page.$('[data-turn-clock].theirs:not([hidden])')));
+  await page.evaluate(() => window.__fake.turnStartedAgo(40));
+  await page.waitForFunction(() => window.__fake.current().state.turn === 'A', null, { timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  check('online: an expired opponent turn is ended automatically and the turn returns', (await page.textContent('.turn')).includes('Ivory') && (await page.evaluate(() => window.__fake.claims)) === 1);
+  check('online: the time-out is announced', /Time's up: Ebony's turn has ended/.test((await page.textContent('.toast').catch(() => '')) ?? ''));
   await page.screenshot({ path: join(SHOTS, 'en-online-timeout.png') });
-  await page.click('[data-act="claim-time"]');
-  await page.waitForFunction(() => !document.querySelector('[data-act="end"]').disabled, null, { timeout: 5000 }).catch(() => {});
-  check('online: expired turn timer can be claimed and the turn returns', (await page.textContent('.turn')).includes('Ivory') && !(await page.$('[data-act="claim-time"]')));
-  // Opponent disappears -> claim win.
+  // My own turn runs out: it ends by itself, once.
+  await page.evaluate(() => window.__fake.turnStartedAgo(40));
+  await page.waitForFunction(() => window.__fake.current().state.turn === 'B', null, { timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  check('online: my expired turn ends by itself, exactly once', (await page.evaluate(() => [window.__fake.current().state.turn, window.__fake.claims].join())) === 'B,2' &&
+    /Time's up: your turn has ended/.test((await page.textContent('.toast').catch(() => '')) ?? ''));
+  // Opponent disappears early in the match (before turn 6) -> claim win.
+  await page.evaluate(() => (window.__fake.current().state.turnNumber = 4));
   await page.evaluate(() => window.__fake.opponentGone(130));
   await page.waitForSelector('[data-act="claim"]', { timeout: 5000 });
   await page.screenshot({ path: join(SHOTS, 'en-online-away.png') });
@@ -562,7 +687,7 @@ for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 
   await page.waitForSelector('.overlay .rating-change', { timeout: 5000 });
   const res = await page.textContent('.overlay');
   check('online: forfeit win shows result and rating change', /You win/.test(res) && /left the match/.test(res) && /\+\d+/.test(res));
-  check('online: an early forfeit win gives no rank points and says why', /No rank points for the win: the match ended before turn 6/.test(res) && !!(await page.$('.overlay .rank-change')));
+  check('online: an early forfeit win gives no rank points and says why', /No rank points for the win: the match ended before turn 6/.test(res) && !!(await page.$('.overlay .rank-change')), res.slice(0, 300));
   check('online: the opponent who left still loses 6 rank points', (await page.evaluate(() => { const m = window.__fake.current(); return m.result.bPointsAfter - m.result.bPointsBefore; })) === -6);
   await page.screenshot({ path: join(SHOTS, 'en-online-result.png') });
   // Back to lobby, join an open match, resign.
@@ -662,6 +787,15 @@ for (const [lang, vp] of [['en', { width: 1280, height: 860 }], ['ar', { width: 
   await page.waitForTimeout(400);
   const cw = await page.evaluate(() => window.__fake.wallet());
   check('wallet: buying spends database coins and equips', cw.coins === 10 && cw.skin === 'neon' && (await page.evaluate(() => document.documentElement.dataset.skin)) === 'neon', JSON.stringify(cw));
+  await page.evaluate(() => window.__fake.setCoins(60));
+  await page.click('[data-act="menu"]');
+  await page.click('.mode-card.shop-card');
+  await page.waitForSelector('.shop-grid.bundles');
+  await page.waitForTimeout(400);
+  await page.click('[data-act="shop-bundle"][data-id="neon_nights"]');
+  await page.waitForTimeout(400);
+  const cb = await page.evaluate(() => window.__fake.wallet());
+  check('wallet: a set bought on the account charges the server price (already-owned skin not paid twice)', cb.coins === 60 - 55 && cb.floor === 'synthwave' && cb.ball === 'neon', JSON.stringify(cb));
   check('wallet: signed-in shop says online matches pay the account', /Online matches pay coins to your account/.test(await page.textContent('.wallet-earn')));
   check('wallet: this browser\'s own coins are untouched', (await page.evaluate(() => JSON.parse(localStorage.getItem('checkline.wallet.v1') || '{"coins":0}').coins)) === 0);
   await page.click('[data-act="menu"]');

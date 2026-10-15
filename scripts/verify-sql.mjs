@@ -20,7 +20,7 @@ const R = await import(join(root, 'build/src/rules/index.js'));
 const { toWire } = await import(join(root, 'build/src/online/wire.js'));
 const { planTurn, legalActions } = await import(join(root, 'build/src/ai/ai.js'));
 const { RANK_TIERS } = await import(join(root, 'build/src/online/ranks.js'));
-const { SHOP_ITEMS } = await import(join(root, 'build/src/ui/economy.js'));
+const { SHOP_ITEMS, BUNDLES } = await import(join(root, 'build/src/ui/economy.js'));
 
 // ------------------------------------------------------------------ local postgres
 function pgBin() {
@@ -370,23 +370,46 @@ check('level at turn 40 is a draw', d?.status === 'finished' && d?.endReason ===
 check('draw rated with Elo (0.5 each) and counted', d?.result && d.result.winnerId === null && d.result.aRatingAfter === r2.rating + expA && d.result.bRatingAfter === r3.rating - expA &&
   rpc(U2, 'public.cl_get_my_profile()').json.draws === r2.draws + 1 && rpc(U3, 'public.cl_get_my_profile()').json.draws === r3.draws + 1);
 
-// Turn timer
+// Turn clock: 25 s per turn (+3 s grace), enforced with the server's clock.
 const m6 = rpc(U1, 'public.cl_create_match(false)').json;
 const j6 = rpc(U2, `public.cl_join_match(${q(m6.code)})`).json;
 const idle = j6.state.turn === 'A' ? U1 : U2;
 const waiter = idle === U1 ? U2 : U1;
-check('timeout: the player to move cannot claim', errOf(rpc(idle, `public.cl_claim_timeout('${m6.id}')`)) === 'CL:not_your_turn');
-check('timeout: not before 90 seconds', errOf(rpc(waiter, `public.cl_claim_timeout('${m6.id}')`)) === 'CL:turn_time_left');
-sql(`update public.cl_matches set turn_started_at = now() - interval '2 minutes', ${idle === U1 ? 'a_seen_at' : 'b_seen_at'} = now() - interval '1 minute' where id = '${m6.id}';`);
-const t6 = rpc(waiter, `public.cl_claim_timeout('${m6.id}')`).json;
+const claim = (as, v) => rpc(as, `public.cl_claim_timeout('${m6.id}', ${v})`);
+const ago = (secs) => sql(`update public.cl_matches set turn_started_at = now() - interval '${secs} seconds' where id = '${m6.id}';`);
+check('clock: nobody can end a turn before its time is up', errOf(claim(waiter, j6.version)) === 'CL:turn_time_left' && errOf(claim(idle, j6.version)) === 'CL:turn_time_left');
+ago(20);
+const early = rpc(idle, `public.cl_submit_action('${m6.id}', ${j6.version}, '{"type":"surge"}'::jsonb)`);
+const startedAfter = sql(`select extract(epoch from now() - turn_started_at)::int from public.cl_matches where id = '${m6.id}';`).out;
+check('clock: an action inside the turn is accepted and does not reset the clock', early.ok && Number(startedAfter) >= 19, early.err || startedAfter);
+const v6 = early.json?.version ?? j6.version;
+ago(27);
+check('clock: still playable inside the 3 s grace', errOf(claim(waiter, v6)) === 'CL:turn_time_left');
+ago(29);
+sql(`update public.cl_matches set ${idle === U1 ? 'a_seen_at' : 'b_seen_at'} = now() - interval '1 minute' where id = '${m6.id}';`);
+check('clock: an action after the deadline is refused and changes nothing', errOf(rpc(idle, `public.cl_submit_action('${m6.id}', ${v6}, '{"type":"endTurn"}'::jsonb)`)) === 'CL:turn_expired' &&
+  sql(`select version from public.cl_matches where id = '${m6.id}';`).out === String(v6));
+check('clock: an expiry request with an old version is refused', errOf(claim(waiter, v6 - 1)) === 'CL:stale_state');
+const t6 = claim(waiter, v6).json;
 const seenAfter = sql(`select extract(epoch from now() - ${idle === U1 ? 'a_seen_at' : 'b_seen_at'})::int from public.cl_matches where id = '${m6.id}';`).out;
-check('timeout ends the idle turn on the server', t6?.version === j6.version + 1 && t6?.state?.turn !== j6.state.turn && t6?.lastEvents?.[0]?.type === 'turnEnd');
-check('timeout does not count as the idle player being present', Number(seenAfter) >= 50);
-check('timeout resets the turn timer', Date.parse(t6.turnStartedAt) > Date.now() - 60000);
+check('clock: an expired turn is ended on the server (unused AP lost)', t6?.version === v6 + 1 && t6?.state?.turn !== j6.state.turn && t6?.lastEvents?.[0]?.type === 'turnEnd');
+check('clock: the timed-out player is not marked present', Number(seenAfter) >= 50);
+check('clock: the next turn starts a fresh clock', Date.parse(t6.turnStartedAt) > Date.now() - 60000);
+check('clock: a repeated expiry request cannot end a second turn', errOf(claim(idle, v6)) === 'CL:stale_state' && errOf(claim(idle, t6.version)) === 'CL:turn_time_left' &&
+  sql(`select version from public.cl_matches where id = '${m6.id}';`).out === String(t6.version));
+// Reconnect: fetching the match resolves an expired turn (once), even if nobody asked.
+ago(40);
+const g1 = rpc(waiter, `public.cl_get_match('${m6.id}')`).json;
+const g2 = rpc(idle, `public.cl_get_match('${m6.id}')`).json;
+check('clock: a reconnecting player gets the expired turn ended, once', g1?.version === t6.version + 1 && g2?.version === g1.version && g1.state.turn === j6.state.turn);
+ago(40);
+rpc(idle, `public.cl_touch_match('${m6.id}')`);
+check('clock: the heartbeat also ends an expired turn', sql(`select version from public.cl_matches where id = '${m6.id}';`).out === String(g1.version + 1));
+const t6b = rpc(waiter, `public.cl_get_match('${m6.id}')`).json;
 
 // Matches from the old rules cannot continue
 sql(`update public.cl_matches set rules_version = 2 where id = '${m6.id}';`);
-check('outdated match refuses new actions', errOf(rpc(waiter, `public.cl_submit_action('${m6.id}', ${t6.version}, '{"type":"endTurn"}'::jsonb)`)) === 'CL:match_outdated');
+check('outdated match refuses new actions', errOf(rpc(waiter, `public.cl_submit_action('${m6.id}', ${t6b.version}, '{"type":"endTurn"}'::jsonb)`)) === 'CL:match_outdated');
 check('outdated match can still be resigned', rpc(waiter, `public.cl_resign('${m6.id}')`).json?.status === 'finished');
 
 // Cancel
@@ -412,6 +435,10 @@ check('ties broken deterministically by id', tie.rows[0].id === U1 && tie.rows[1
 
 // ------------------------------------------------------------------ C-ranks
 check('rank tiers in SQL match src/online/ranks.ts', sql("select string_agg(code || ':' || min_points, ',' order by sort) from public.rank_tiers;").out === RANK_TIERS.map((t) => `${t.tier}:${t.min}`).join(','));
+check('bundles in SQL match src/ui/economy.ts', sql("select string_agg(b.id || ':' || b.price || ':' || (select string_agg(i.kind || '=' || i.item_id, '+' order by i.kind) from public.bundle_items i where i.bundle_id = b.id), ',' order by b.id) from public.bundles b;").out ===
+  [...BUNDLES].sort((a, b) => (a.id < b.id ? -1 : 1)).map((b) => `${b.id}:${b.price}:${[...b.items].sort((x, y) => (x.kind < y.kind ? -1 : 1)).map((i) => `${i.kind}=${i.id}`).join('+')}`).join(','));
+check('every set costs less than its three items', sql(`select count(*) from public.bundles b where b.price >= (select sum(c.price) from public.bundle_items i join public.cosmetics c on c.kind = i.kind and c.id = i.item_id where i.bundle_id = b.id);`).out === '0' &&
+  sql(`select count(*) from public.bundles b where (select count(distinct kind) from public.bundle_items i where i.bundle_id = b.id) <> 3;`).out === '0');
 check('shop prices in SQL match src/ui/economy.ts', sql("select string_agg(kind || ':' || id || ':' || price, ',' order by kind, id) from public.cosmetics;").out ===
   [...SHOP_ITEMS].sort((a, b) => (a.kind + ':' + a.id < b.kind + ':' + b.id ? -1 : 1)).map((i) => `${i.kind}:${i.id}:${i.price}`).join(','));
 const tierOf = (pts) => sql(`select checkline_private.rank_json(${pts}) ->> 'tier';`).out;
@@ -477,6 +504,39 @@ check('price changes in public.cosmetics apply to purchases', sql(`update public
   sql(`select amount from public.coin_transactions where user_id = '${U1}' and item = 'skin:neon';`).out === '-1');
 check('equipping an unowned item by hand is refused', /not_owned/.test(sql(`update public."user" set equipped_skin = 'gold' where id = '${U3}';`).err));
 
+// ------------------------------------------------------------------ balls and full sets
+const U7 = '77777777-7777-4777-8777-777777777777';
+sql(`insert into auth.users (id, email, is_anonymous, raw_user_meta_data) values ('${U7}', 'kim@example.com', false, '{"display_name":"Kim"}');`);
+const W7 = () => W(U7);
+check('new players own the Classic ball too', W7()?.owned?.includes('ball:classic') && W7()?.ball === 'classic' && W7()?.prices?.['ball:gold'] === 35 && W7()?.prices?.['bundle:champion'] === 99);
+check('unknown set refused', errOf(rpc(U7, "public.cl_buy_bundle('nope')")) === 'CL:unknown_item');
+admin('Kim', 54, 'Set test');
+check('set: too few coins refused, nothing changes', errOf(rpc(U7, "public.cl_buy_bundle('neon_nights')")) === 'CL:too_poor' && W7().coins === 54 && W7().owned.length === 3);
+admin('Kim', 1, 'Set test');
+const nb = rpc(U7, "public.cl_buy_bundle('neon_nights')").json;
+check('set: one payment, three items, all equipped', nb?.coins === 0 && nb.floor === 'synthwave' && nb.skin === 'neon' && nb.ball === 'neon' &&
+  ['floor:synthwave', 'skin:neon', 'ball:neon'].every((x) => nb.owned.includes(x)) &&
+  sql(`select string_agg(amount || '|' || item, ',') from public.coin_transactions where user_id = '${U7}' and kind = 'purchase';`).out === '-55|bundle:neon_nights' &&
+  sql(`select count(*) from public.user_cosmetics where user_id = '${U7}' and source = 'bundle';`).out === '3');
+rpc(U7, "public.cl_buy_item('floor', 'classic')");
+const again = rpc(U7, "public.cl_buy_bundle('neon_nights')").json;
+check('set already owned: equips it again for free', again?.coins === 0 && again.floor === 'synthwave' && sql(`select count(*) from public.coin_transactions where user_id = '${U7}' and kind = 'purchase';`).out === '1');
+// Partly owned: pay the lower of the set price and the missing items.
+sql(`insert into public.user_cosmetics (user_id, kind, item_id, source) values ('${U7}', 'skin', 'obsidian', 'admin'), ('${U7}', 'ball', 'cosmic', 'admin');`);
+admin('Kim', 100, 'Set test');
+const cb = rpc(U7, "public.cl_buy_bundle('cosmic')").json;
+check('set partly owned: pays only the missing floor (60, not 70)', cb?.coins === 40 && cb.floor === 'galaxy' && cb.skin === 'obsidian' && cb.ball === 'cosmic');
+sql(`insert into public.user_cosmetics (user_id, kind, item_id, source) values ('${U7}', 'skin', 'gold', 'admin');`);
+admin('Kim', 100, 'Set test');
+const ch = rpc(U7, "public.cl_buy_bundle('champion')").json;
+check('set partly owned: never more than the set price (99, not 115)', ch?.coins === 140 - 99 && ch.floor === 'prism' && ch.ball === 'gold');
+check('balls buy and equip on their own (mix and match)', rpc(U7, "public.cl_buy_item('ball', 'ember')").json?.ball === 'ember' && W7().floor === 'prism' && W7().skin === 'gold' && W7().coins === 41 - 12);
+check('equipping an unowned ball by hand is refused', /not_owned/.test(sql(`update public."user" set equipped_ball = 'frost' where id = '${U7}';`).err));
+check('retired sets cannot be bought', sql(`update public.bundles set active = false where id = 'cosmic';`).ok && errOf(rpc(U1, "public.cl_buy_bundle('cosmic')")) === 'CL:unknown_item');
+sql(`update public.bundles set active = true where id = 'cosmic';`);
+check('players cannot change set prices or contents', /permission denied/.test(sql(`update public.bundles set price = 0;`, U7).err) && /permission denied/.test(sql(`delete from public.bundle_items;`, U7).err));
+check('coin history still adds up after sets', ledgerOk());
+
 // ------------------------------------------------------------------ privacy and Auth sync
 check('players read only their own row', sql('select count(*) from public."user";', U3).out === '1' && sql('select count(*) from public.coin_transactions;', U3).out === sql(`select count(*) from public.coin_transactions where user_id = '${U3}';`).out);
 check('visitors cannot read players', /permission denied/.test(sql('select count(*) from public."user";', 'anon').err));
@@ -488,7 +548,7 @@ check('own profile includes own email', rpc(U1, 'public.cl_get_my_profile()').js
 const U6 = '66666666-6666-4666-8666-666666666666';
 sql(`insert into auth.users (id, email, is_anonymous, raw_user_meta_data) values ('${U6}', 'eve@example.com', false, '{"display_name":"Eve"}');`);
 check('sign-up creates the player row with email and Classic items', sql(`select username || '|' || email || '|' || is_guest from public."user" where id = '${U6}';`).out === 'Eve|eve@example.com|false' &&
-  sql(`select count(*) from public.user_cosmetics where user_id = '${U6}' and item_id = 'classic';`).out === '2');
+  sql(`select count(*) from public.user_cosmetics where user_id = '${U6}' and item_id = 'classic';`).out === '3');
 check('email changed in Authentication updates the player row', sql(`update auth.users set email = 'eve2@example.com' where id = '${U6}';`).ok && sql(`select email from public."user" where id = '${U6}';`).out === 'eve2@example.com');
 check('guest upgraded to an email account becomes ranked-eligible', sql(`update auth.users set is_anonymous = false, email = 'sara@example.com' where id = '${U3}';`).ok && sql(`select is_guest from public."user" where id = '${U3}';`).out === 'f');
 check('deleting the account deletes the player and their data', sql(`delete from auth.users where id = '${U6}';`).ok && sql(`select count(*) from public."user" where id = '${U6}';`).out === '0');

@@ -87,7 +87,7 @@ scenario(
   ],
   (sql) => {
     check('v0.3 + cl_users: player, rating, coins and equipped items kept', row(sql, ORVD) === 'ORVD|orvd@example.com|42|neon|gold|1216', row(sql, ORVD));
-    check('v0.3 + cl_users: items moved to user_cosmetics', owned(sql, ORVD) === 'floor:classic,floor:neon,skin:classic,skin:gold', owned(sql, ORVD));
+    check('v0.3 + cl_users: items moved to user_cosmetics', owned(sql, ORVD) === 'ball:classic,floor:classic,floor:neon,skin:classic,skin:gold', owned(sql, ORVD));
     check('v0.3 + cl_users: coins recorded once as a migration', sql(`select count(*) || '|' || sum(amount) from public.coin_transactions where kind = 'migration';`).out === '1|42' && ledgerOk(sql));
     check('v0.3 + cl_users: old table kept privately', sql(`select to_regclass('public.cl_users') is null and to_regclass('checkline_private.legacy_cl_users') is not null;`).out === 't');
   },
@@ -102,7 +102,7 @@ scenario(
     ['new setup', setup],
   ],
   (sql) => {
-    check('v0.3 + cl_wallets: coins and items kept', row(sql, BOB) === 'Bob|bob@example.com|17|sunset|classic|1200' && owned(sql, BOB) === 'floor:classic,floor:sunset,skin:classic', row(sql, BOB));
+    check('v0.3 + cl_wallets: coins and items kept', row(sql, BOB) === 'Bob|bob@example.com|17|sunset|classic|1200' && owned(sql, BOB) === 'ball:classic,floor:classic,floor:sunset,skin:classic', row(sql, BOB));
     check('v0.3 + cl_wallets: empty wallet adds no history', sql(`select count(*) from public.coin_transactions where user_id = '${ORVD}';`).out === '0' && ledgerOk(sql));
   },
 );
@@ -133,6 +133,31 @@ scenario(
 );
 
 scenario(
+  'v0.4 (public."user") to v0.5',
+  [
+    ['stub', stub],
+    ['v0.4 setup', read('supabase/tests/legacy/v04.sql')],
+    [
+      'v0.4 data',
+      `${accounts}
+      select public.cl_admin_adjust_coins('ORVD', 77, 'Before upgrade');
+      insert into public.user_cosmetics (user_id, kind, item_id, source) values ('${ORVD}', 'floor', 'neon', 'purchase'), ('${ORVD}', 'skin', 'gold', 'purchase');
+      update public."user" set equipped_floor = 'neon', equipped_skin = 'gold' where id = '${ORVD}';`,
+    ],
+    ['new setup', setup],
+    ['new setup again', setup],
+  ],
+  (sql) => {
+    check('v0.4: coins, items and equipped cosmetics kept', row(sql, ORVD) === 'ORVD|orvd@example.com|77|neon|gold|1200', row(sql, ORVD));
+    check('v0.4: everyone gets the Classic ball, nothing else changes', owned(sql, ORVD) === 'ball:classic,floor:classic,floor:neon,skin:classic,skin:gold' &&
+      sql(`select equipped_ball from public."user" where id = '${ORVD}';`).out === 'classic', owned(sql, ORVD));
+    check('v0.4: coin history kept and still adds up', sql(`select count(*) from public.coin_transactions;`).out === '1' && ledgerOk(sql));
+    check('v0.4: new floors, balls and sets added', sql(`select count(*) from public.cosmetics;`).out === '18' && sql(`select count(*) from public.bundle_items;`).out === '9');
+    check('v0.4: old 90-second claim function replaced', sql(`select string_agg(pg_get_function_identity_arguments(oid), ';') from pg_proc where proname = 'cl_claim_timeout';`).out === 'p_match_id uuid, p_expected_version integer');
+  },
+);
+
+scenario(
   'empty step-1 table (the live project today)',
   [
     ['stub', stub],
@@ -141,7 +166,7 @@ scenario(
   ],
   (sql) => {
     const tables = sql(`select string_agg(table_name, ',' order by table_name) from information_schema.tables where table_schema = 'public';`).out;
-    check('empty step-1 table: removed, nothing else left behind', tables === 'cl_match_moves,cl_match_results,cl_matches,coin_transactions,cosmetics,rank_tiers,user,user_cosmetics', tables);
+    check('empty step-1 table: removed, nothing else left behind', tables === 'bundle_items,bundles,cl_match_moves,cl_match_results,cl_matches,coin_transactions,cosmetics,rank_tiers,user,user_cosmetics', tables);
   },
 );
 

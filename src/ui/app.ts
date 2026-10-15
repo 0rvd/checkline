@@ -21,6 +21,7 @@ import {
 import {
   OnlineError,
   SupabaseBackend,
+  TURN_GRACE_SECONDS,
   TURN_SECONDS,
   myTeamIn,
   toOnlineError,
@@ -55,7 +56,7 @@ import { renderBoard } from './board.js';
 import { burstAt, confetti, flipTokens, flyBall, reducedMotion, setReduceMotion, snapshotTokens } from './motion.js';
 import { BALL_SVG, SVG_DEFS, moveDiagram, pieceSvg } from './pieces.js';
 import { play, setSoundEnabled } from './sound.js';
-import { applyTheme, awardMatch, buyOrEquip, findItem, fromServer, loadWallet, type Award, type ItemKind, type Wallet } from './economy.js';
+import { applyTheme, awardMatch, buyBundle, buyOrEquip, findBundle, findItem, fromServer, loadWallet, type Award, type ItemKind, type Wallet } from './economy.js';
 import {
   errorText,
   langSwitch,
@@ -109,7 +110,9 @@ interface OnlineGame {
 const SETTINGS_KEY = 'checkline.settings.v2';
 const ACTIVE_MATCH_KEY = 'checkline.online.match';
 const AWAY_AFTER_S = 30;
-const CLAIM_AFTER_S = 95; // server allows 90 s; a little margin for clock skew
+const CLAIM_AFTER_S = 95; // forfeit: server allows 90 s away; a little margin for clock skew
+/** Last seconds of a turn are highlighted. */
+const CLOCK_LOW_S = 5;
 
 function store<T>(k: string, v?: T): T | null {
   try {
@@ -220,6 +223,17 @@ export class App {
   private flashTimer = 0;
   private overlayTimer = 0;
 
+  // turn clock: TURN_SECONDS for every human-controlled turn (local, computer, online)
+  private clockKey = '';
+  private clockLeftMs = TURN_SECONDS * 1000;
+  private clockLast = 0;
+  /** No countdown until this time (animations, banners, kickoff). */
+  private clockHoldUntil = 0;
+  private claimBusy = false;
+  /** Online: match version an expiry claim was last sent for, and when to retry. */
+  private claimTried = -1;
+  private claimRetryAt = 0;
+
   constructor(private root: HTMLElement) {
     const saved = store<Partial<Settings>>(SETTINGS_KEY) ?? {};
     this.settings = { rotate: false, handoff: true, reduceMotion: false, sound: true, ...saved };
@@ -250,6 +264,7 @@ export class App {
     (window as unknown as { __checklineState: () => unknown }).__checklineState = () => toWire(this.game);
     this.anim.enter = true;
     this.requestRender();
+    window.setInterval(() => this.tickClock(), 200);
   }
 
   // ================================================================== screens & flows
@@ -270,6 +285,7 @@ export class App {
   private beginGame(kind: GameKind, state: MatchState): void {
     this.matchKey = `${kind}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     this.lastAward = null;
+    this.clockKey = '';
     this.cancelAi();
     this.kind = kind;
     this.game = state;
@@ -414,6 +430,7 @@ export class App {
       else if (mv && mv.type === 'tackle') this.anim.ripple = mv.at;
       else if (scorer?.pos) this.anim.ripple = scorer.pos;
     }
+    this.holdClock(goal || this.anim.turnBanner ? 1300 : this.anim.pass || this.anim.shot ? 800 : 350);
     if (g.carrierId !== before.carrierId && !goal) this.anim.gainId = g.carrierId;
     if (g.turn === before.turn && g.ap < before.ap) this.anim.spentPip = g.ap;
     this.scheduleFlashClear();
@@ -514,6 +531,7 @@ export class App {
     if (wasHandoff && this.screen === 'game') {
       if (this.kind !== 'local') this.anim.turnBanner = this.bannerText(this.game.turn);
       this.anim.kickoff = true;
+      this.holdClock(1300);
     }
     this.requestRender();
     this.maybeRunAi();
@@ -1232,12 +1250,18 @@ export class App {
     this.requestRender();
   }
 
+  /** Online: the current turn is past its server deadline; ask the server to end it.
+   *  Either player may ask; the server checks the time and the match version, so a turn is
+   *  only ever ended once (a late or repeated request is refused and simply resyncs). */
   private async claimTime(): Promise<void> {
     const og = this.og;
     const be = this.backend;
-    if (!og || !be) return;
+    if (!og || !be || this.claimBusy) return;
+    const idle = this.game.turn;
+    this.claimBusy = true;
     try {
-      const m = await be.claimTimeout(og.match.id);
+      const m = await be.claimTimeout(og.match.id, og.version);
+      if (this.og !== og) return;
       const before = this.game;
       og.match = m;
       if (m.state && m.version > og.version) {
@@ -1246,12 +1270,19 @@ export class App {
         this.game = fromWire(m.state);
         this.afterChange(before, m.lastEvents ?? [], 'remote');
       }
-      this.showToast(() => t('online.timeClaimed'));
-    } catch (e) {
-      const err = toOnlineError(e);
-      this.showToast(() => errorText(err));
+      this.timeUpToast(idle);
+    } catch {
+      // Already ended (by the other player or the server), or not quite due: just catch up.
+      if (this.og === og) await this.resyncOnline(false);
+    } finally {
+      this.claimBusy = false;
     }
     this.requestRender();
+  }
+
+  private timeUpToast(idle: Team): void {
+    const mine = this.kind === 'online' ? idle === this.og?.myTeam : this.kind === 'ai' ? idle === this.humanTeam : true;
+    this.showToast(() => (mine && this.kind !== 'local' ? t('clock.youTimedOut') : t('clock.timedOut', { team: teamName(idle) })), false);
   }
 
   private opponentStatus(): { online: boolean; secondsAway: number } {
@@ -1263,11 +1294,121 @@ export class App {
     return { online, secondsAway: online ? 0 : secondsAway };
   }
 
-  /** Seconds left in the current online turn (null if not applicable). */
-  private turnSecondsLeft(): number | null {
+  /** Online: milliseconds until the server deadline of the current turn (null if not applicable).
+   *  The server allows TURN_SECONDS plus TURN_GRACE_SECONDS for network delay and the move
+   *  animation; the clock shows at most TURN_SECONDS of it. */
+  private onlineMsLeft(): number | null {
     const og = this.og;
-    if (!og || og.match.status !== 'active' || !og.match.turnStartedAt) return null;
-    return Math.max(0, TURN_SECONDS - Math.floor((Date.now() + og.skewMs - Date.parse(og.match.turnStartedAt)) / 1000));
+    if (!og || og.match.status !== 'active' || og.outdated || !og.match.turnStartedAt) return null;
+    const deadline = Date.parse(og.match.turnStartedAt) + (TURN_SECONDS + TURN_GRACE_SECONDS) * 1000;
+    return deadline - (Date.now() + og.skewMs);
+  }
+
+  private turnLimitMs(): number {
+    // Test hook: automated UI checks may shorten or lengthen local turns.
+    const o = (window as unknown as { __CHECKLINE_TURN_SECONDS__?: number }).__CHECKLINE_TURN_SECONDS__;
+    return (typeof o === 'number' && o > 0 ? o : TURN_SECONDS) * 1000;
+  }
+
+  private holdClock(ms: number): void {
+    const until = performance.now() + (reducedMotion() ? Math.min(ms, 150) : ms);
+    if (until > this.clockHoldUntil) this.clockHoldUntil = until;
+  }
+
+  /** What the turn clock shows now (null = hidden). */
+  private clockView(): { secs: number; frac: number; mine: boolean; paused: boolean } | null {
+    if (this.screen !== 'game' || this.game.phase !== 'playing') return null;
+    const limit = TURN_SECONDS * 1000;
+    if (this.kind === 'online') {
+      const left = this.onlineMsLeft();
+      if (left === null) return null;
+      const ms = Math.max(0, Math.min(limit, left));
+      return { secs: Math.ceil(ms / 1000), frac: ms / limit, mine: this.game.turn === this.og?.myTeam, paused: false };
+    }
+    if (this.kind !== 'local' && this.kind !== 'ai') return null;
+    if (this.kind === 'ai' && this.game.turn !== this.humanTeam) return null;
+    const full = this.turnLimitMs();
+    const ms = this.clockKey === this.turnKey() ? Math.max(0, this.clockLeftMs) : full;
+    return { secs: Math.ceil(ms / 1000), frac: ms / full, mine: true, paused: !this.clockRunning() };
+  }
+
+  private turnKey(): string {
+    const g = this.game;
+    return `${g.turnNumber}|${g.turn}|${g.rally}|${g.score.A}-${g.score.B}`;
+  }
+
+  /** Local / computer: the countdown only runs while the player can actually act. */
+  private clockRunning(): boolean {
+    return this.activeTeam() !== null && !this.overlay && performance.now() >= this.clockHoldUntil;
+  }
+
+  private tickClock(): void {
+    const now = performance.now();
+    const dt = this.clockLast ? Math.min(now - this.clockLast, 1000) : 0;
+    this.clockLast = now;
+    if (this.screen !== 'game' || this.game.phase !== 'playing') return;
+    if (this.kind === 'online') {
+      const left = this.onlineMsLeft();
+      const og = this.og;
+      if (og && left !== null && left <= 0 && !og.pending && !this.claimBusy && (this.claimTried !== og.version || now >= this.claimRetryAt)) {
+        // The opponent's own game normally ends their turn; step in shortly after if it doesn't.
+        if (this.game.turn === og.myTeam || left <= -800) {
+          this.claimTried = og.version;
+          this.claimRetryAt = now + 2500;
+          void this.claimTime();
+        }
+      }
+      this.paintClock();
+      return;
+    }
+    if (this.kind !== 'local' && this.kind !== 'ai') return;
+    const key = this.turnKey();
+    if (key !== this.clockKey) {
+      this.clockKey = key;
+      this.clockLeftMs = this.turnLimitMs();
+    }
+    if (this.clockRunning()) {
+      this.clockLeftMs -= dt;
+      if (this.clockLeftMs <= 0) {
+        this.clockLeftMs = 0;
+        this.localTimeout();
+      }
+    }
+    this.paintClock();
+  }
+
+  /** Local / computer: time is up, so the turn ends as if End turn had been pressed. */
+  private localTimeout(): void {
+    const team = this.game.turn;
+    this.selected = null;
+    this.log.unshift({ note: 'log.timeout', teamParam: team });
+    this.act({ type: 'endTurn' }, 'human');
+    this.timeUpToast(team);
+    play('whistle');
+    this.requestRender();
+  }
+
+  /** Cheap per-tick update of the turn clock (no full re-render). */
+  private paintClock(): void {
+    const el = this.root.querySelector<HTMLElement>('[data-turn-clock]');
+    if (!el) return;
+    const v = this.clockView();
+    el.hidden = !v;
+    if (!v) return;
+    const num = el.querySelector('b');
+    if (num && num.textContent !== String(v.secs)) num.textContent = String(v.secs);
+    el.style.setProperty('--left', v.frac.toFixed(3));
+    el.classList.toggle('low', v.secs <= CLOCK_LOW_S);
+    el.classList.toggle('theirs', !v.mine);
+    el.classList.toggle('paused', v.paused);
+    const label = t(v.mine ? 'clock.aria' : 'clock.ariaTheirs', { n: v.secs });
+    if (el.getAttribute('aria-label') !== label) el.setAttribute('aria-label', label);
+  }
+
+  private clockHtml(): string {
+    if (this.kind === 'tutorial') return '';
+    return `<span class="turn-clock" data-turn-clock role="timer" title="${esc(t('clock.tip', { n: TURN_SECONDS }))}" hidden>
+        <span class="clock-icon" aria-hidden="true">⏱</span><b dir="ltr">${TURN_SECONDS}</b><i class="clock-bar" aria-hidden="true"><i></i></i></span>`;
   }
 
   /** Cheap per-second refresh of the presence block and turn timer (no full re-render). */
@@ -1281,12 +1422,6 @@ export class App {
         el.innerHTML = html;
         el.dataset.html = html;
       }
-    }
-    const timer = this.root.querySelector<HTMLElement>('[data-timer]');
-    if (timer) {
-      const s = this.turnSecondsLeft();
-      timer.textContent = s === null ? '' : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-      timer.classList.toggle('low', s !== null && s <= 15);
     }
   }
 
@@ -1562,9 +1697,6 @@ export class App {
       case 'claim':
         void this.claimWin();
         return;
-      case 'claim-time':
-        void this.claimTime();
-        return;
       case 'leaderboard':
         this.openLeaderboard();
         return;
@@ -1574,6 +1706,9 @@ export class App {
         return;
       case 'shop-item':
         this.shopItem(el.dataset.kind as ItemKind, el.dataset.id ?? '');
+        return;
+      case 'shop-bundle':
+        this.shopBundle(el.dataset.id ?? '');
         return;
       case 'lb-prev':
         this.lb.page = Math.max(0, this.lb.page - 1);
@@ -1817,6 +1952,7 @@ export class App {
       if (host) confetti(host, anim.confetti === 'A' ? ['#f2e9d6', '#d8a84c', '#fffaf0'] : ['#2b2f34', '#d8a84c', '#a8853c']);
     }
     if (this.og) this.updatePresence();
+    this.paintClock();
     this.anim = { flash: anim.flash, ghost: anim.ghost };
   }
 
@@ -1891,8 +2027,7 @@ export class App {
     if (this.kind === 'ai' && this.aiState !== 'idle') thinking = `<span class="thinking"><span class="spinner sm"></span>${esc(t(this.aiState === 'thinking' ? 'ai.thinking' : 'ai.playing'))}</span>`;
     if (this.kind === 'online' && this.og) {
       const conn = this.og.conn;
-      thinking = `<span class="turn-timer" data-timer title="${esc(t('online.timerTip', { n: TURN_SECONDS }))}"></span>
-        <span class="conn ${conn}"><i></i>${esc(t(conn === 'live' ? 'online.conn.live' : conn === 'connecting' ? 'online.conn.connecting' : 'online.conn.offline'))}</span>`;
+      thinking = `<span class="conn ${conn}"><i></i>${esc(t(conn === 'live' ? 'online.conn.live' : conn === 'connecting' ? 'online.conn.connecting' : 'online.conn.offline'))}</span>`;
     }
     return `
       <header class="status" role="status" aria-live="polite">
@@ -1900,6 +2035,7 @@ export class App {
         ${scoreBlock}
         <div class="turn ${g.turn}"><span class="label">${esc(t('status.turn'))}</span>
           <span class="team-dot ${g.turn}"></span><strong>${esc(teamName(g.turn))}</strong></div>
+        ${this.clockHtml()}
         <div class="ap" aria-label="${esc(t('status.apAria', { n: g.ap, max: g.config.apPerTurn }))}">
           <span class="label">${esc(t('status.ap'))}</span>${pips}</div>
         ${surge}
@@ -1981,10 +2117,6 @@ export class App {
         s.secondsAway >= CLAIM_AFTER_S
           ? `<p class="small">${esc(t('online.claimReady'))}</p><button class="btn small primary" data-act="claim">${esc(t('act.claimWin'))}</button>`
           : `<p class="small muted">${esc(t('online.claimIn', { n: CLAIM_AFTER_S - s.secondsAway }))}</p>`;
-    }
-    const left = this.turnSecondsLeft();
-    if (og.match.status === 'active' && this.game.turn !== og.myTeam && left === 0) {
-      claim += `<p class="small">${esc(t('online.timeUp'))}</p><button class="btn small" data-act="claim-time">${esc(t('act.claimTime'))}</button>`;
     }
     return `<div class="player-line"><span class="presence ${state}"><i></i></span>
         <span><bdi>${esc(opp?.name ?? '?')}</bdi> <span class="rating-chip" dir="ltr">${opp?.rating ?? ''}</span></span>
@@ -2204,6 +2336,39 @@ export class App {
     this.showToast(() => t(res === 'bought' ? 'shop.bought' : 'shop.equippedToast', { name: name() }));
   }
 
+  /** Buy (or re-equip) a full set: pitch floor + piece skin + ball. */
+  private shopBundle(id: string): void {
+    if (!findBundle(id)) return;
+    const name = () => t(`bundle.${id}.name` as MessageKey);
+    if (this.cloudWallet && this.backend) {
+      void this.shopBundleCloud(this.backend, id, name);
+      return;
+    }
+    const res = buyBundle(this.wallet, id);
+    if (res === 'too_poor') {
+      play('error');
+      this.showToast(() => t('shop.tooPoor'));
+      return;
+    }
+    play(res === 'bought' ? 'goal' : 'move');
+    this.showToast(() => t(res === 'bought' ? 'bundle.bought' : 'bundle.equipped', { name: name() }));
+  }
+
+  private async shopBundleCloud(be: OnlineBackend, id: string, name: () => string): Promise<void> {
+    const before = this.wallet.owned.length;
+    try {
+      this.wallet = fromServer(this.wallet, await be.buyBundle(id));
+      applyTheme(this.wallet);
+      const bought = this.wallet.owned.length > before;
+      play(bought ? 'goal' : 'move');
+      this.showToast(() => t(bought ? 'bundle.bought' : 'bundle.equipped', { name: name() }));
+    } catch (e) {
+      const err = toOnlineError(e);
+      play('error');
+      this.showToast(() => (err.code === 'too_poor' ? t('shop.tooPoor') : errorText(err)));
+    }
+  }
+
   private async shopItemCloud(be: OnlineBackend, kind: ItemKind, id: string): Promise<void> {
     const had = this.wallet.owned.includes(`${kind}:${id}`);
     try {
@@ -2229,7 +2394,7 @@ export class App {
     if (a.bonus) parts.push(t('ov.coinsBonus', { n: a.bonus }));
     const next = t('ov.coinsNext', { n: a.toNext });
     return `<div class="award ${a.coins ? 'paid' : ''}">
-        ${a.coins ? `<p class="award-total">${coinIcon()}<strong dir="ltr">+${a.coins}</strong> <span>${esc(t('ov.coinsEarned'))}</span></p>` : ''}
+        ${a.coins ? `<p class="award-total"><span class="emoji" aria-hidden="true">🎉</span>${coinIcon()}<strong dir="ltr">+${a.coins}</strong> <span>${esc(t('ov.coinsEarned'))}</span></p>` : ''}
         <p class="small muted">${esc([...parts, next].join(' · '))}</p>
       </div>`;
   }
@@ -2253,7 +2418,7 @@ export class App {
       rank = `<p class="rank-change">${tierChip(rankFor(after).tier)} <span dir="ltr" class="rating-change ${d >= 0 ? 'up' : 'down'}">${before} → <strong>${after}</strong> (${d >= 0 ? '+' : ''}${d})</span> <span class="small muted">${esc(t('rank.points'))}</span></p>${note}`;
     }
     return `<div class="award ${coins ? 'paid' : ''}">
-        ${coins ? `<p class="award-total">${coinIcon()}<strong dir="ltr">+${coins}</strong> <span>${esc(t('ov.coinsEarned'))}</span></p>` : ''}
+        ${coins ? `<p class="award-total"><span class="emoji" aria-hidden="true">🎉</span>${coinIcon()}<strong dir="ltr">+${coins}</strong> <span>${esc(t('ov.coinsEarned'))}</span></p>` : ''}
         ${rank}
       </div>`;
   }
