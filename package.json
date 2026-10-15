@@ -1,6 +1,6 @@
 {
   "name": "checkline-prototype",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Checkline: tactical football on an 8x12 chessboard pitch. Local, computer and online (Supabase) play in English and Arabic.",
   "author": "Mohammed Khalid <mohammedkhalidcs@gmail.com>",
@@ -12,7 +12,7 @@
     "test": "npm run build && node --test \"build/tests/**/*.test.js\"",
     "start": "npm run build && node scripts/serve.mjs",
     "serve": "node scripts/serve.mjs",
-    "verify:sql": "npm run build && node scripts/verify-sql.mjs",
+    "verify:sql": "npm run build && node scripts/verify-sql.mjs && node scripts/verify-upgrade.mjs",
     "config": "node scripts/write-config.mjs",
     "e2e": "node tests/e2e/ui-check.mjs"
   },

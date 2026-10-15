@@ -117,6 +117,14 @@ The same rules run in five places:
 * **Upgrade from v0.2:** `setup.sql` adds the new columns in place. Matches that were active under the old rules are marked `rules_version 2`; they can be viewed and resigned but not played. The app shows "Old rules" in the lobby.
 * **Library:** supabase-js 2.45.4 is loaded at runtime from a pinned jsDelivr ESM URL, and only when online features are used. Set `SUPABASE_JS_URL` to self-host it.
 
+## Accounts, C-ranks and coins (v0.4)
+* **One player table, `public."user"`.** It replaces `cl_profiles` (renamed in place, so ids and foreign keys are kept) and absorbs the v0.3 coin tables. Email is copied from Auth for the owner's convenience but readable only by the player; public screens get names, Elo and tier through functions. Passwords are never copied: Supabase Auth is the only place they exist.
+* **Elo and C-rank are separate.** Elo (K = 32) keeps ordering the leaderboard and is untouched, so v0.3 behaviour is preserved. The C-rank ladder is the visible progression: fixed +10 / −6 / 0 steps are easy to understand and make the 150-point tiers a predictable 15+ wins each.
+* **Anti-abuse beyond the proposal.** A flat +10 per win is easy to farm with a second account that resigns at once. So: guests are never ranked (anonymous accounts cost nothing), a win that ended before turn 6 by resign / forfeit gives the winner 0 while the quitter still loses 6 (no free points, no dodging a loss), and points from the same opponent are capped at 3 wins per 24 hours. Losses are never capped.
+* **Tiers are derived, never stored.** `rank_tiers` holds the thresholds; every read computes the tier from `rank_points`, so editing points (or the table) can never leave a stale tier.
+* **Coins only from what the server can verify.** Online results are produced by the server, so it pays them in the same transaction as the result. Matches against the computer run only in the browser; paying an account for them would mean trusting a client report, so they pay only the signed-out browser wallet. The browser wallet never syncs up to an account.
+* **Every coin change is in `coin_transactions`.** Server functions write the row themselves; a trigger records direct edits (Table Editor) as `manual_edit`, so balances always equal the sum of their history. Admin grants go through `cl_admin_adjust_coins` (owner / service role only, note required, never below zero).
+
 ## Interpretations to review
 1. **Golden goal** applies only after a level score at turn 30. A goal then wins immediately, even if the score isn't 3.
 2. **Turn counting:** the clock counts turns (one side's 3 AP), not rounds. 30 turns is 15 each.
