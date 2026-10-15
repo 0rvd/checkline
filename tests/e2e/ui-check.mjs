@@ -47,7 +47,7 @@ async function newPage(opts = {}) {
   page.on('pageerror', (e) => page.errors.push(String(e)));
   page.on('console', (m) => m.type() === 'error' && !ignorable(m.text()) && page.errors.push(m.text()));
   await page.goto(BASE);
-  await page.waitForSelector('#app > *');
+  await page.waitForSelector('#app > :not(.splash)');
   return page;
 }
 
@@ -121,7 +121,7 @@ for (const lang of ['en', 'ar']) {
   const page = await newPage({ lang: 'en' });
   await page.click('[data-lang="ar"]');
   await page.reload();
-  await page.waitForSelector('#app > *');
+  await page.waitForSelector('#app > :not(.splash)');
   check('language remembered after reload', (await page.evaluate(() => document.documentElement.lang)) === 'ar');
   await page.click('[data-act="play-local"]');
   await closeOverlay(page);

@@ -17,7 +17,14 @@
     <script src="config.js"></script>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <!-- ADDED LOGO HERE: splash / loading screen. It shows while the game loads and is
+           replaced automatically by the menu on the game's first render. -->
+      <div class="splash" role="status" aria-label="Loading Checkline">
+        <img class="splash-logo" src="assets/Logo.png" alt="Checkline" width="1440" height="430" onerror="this.remove()" />
+        <span class="splash-bar" aria-hidden="true"><i></i></span>
+      </div>
+    </div>
     <noscript>Checkline needs JavaScript.</noscript>
     <script type="module" src="build/src/main.js"></script>
   </body>

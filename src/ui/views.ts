@@ -98,8 +98,13 @@ export function renderMenu(o: { onlineOk: boolean; resume: boolean; account?: Me
       <div class="menu-card">
         <div class="menu-hero">
           <div class="menu-copy">
-            <p class="eyebrow">${esc(t('app.eyebrow'))}</p>
-            <h1 class="wordmark" dir="ltr">CHECK<span>LINE</span></h1>
+            <!-- ADDED LOGO HERE: main menu logo (assets/Logo.png). If the image is missing,
+                 the original text wordmark is shown instead. -->
+            <h1 class="brand">
+              <img class="brand-logo" src="assets/Logo.png" alt="Checkline" width="1440" height="430" decoding="async"
+                onerror="this.closest('.brand').classList.add('no-logo')" />
+              <span class="wordmark brand-fallback" dir="ltr">CHECK<span>LINE</span></span>
+            </h1>
             <p class="tagline">${esc(t('app.tagline'))}</p>
             <p class="pitchline">${esc(t('app.pitchline'))}</p>
             <ul class="feats">${feats.map((k) => `<li>${esc(t(k))}</li>`).join('')}</ul>

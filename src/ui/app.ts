@@ -2226,6 +2226,8 @@ export class App {
       const humanSide = this.kind === 'ai' ? this.humanTeam : o.team;
       const isAiTurn = this.kind === 'ai' && o.team !== this.humanTeam;
       body = `
+        <!-- ADDED LOGO HERE: small header on the hand-off screen (the game is paused between turns) -->
+        <img class="modal-logo" src="assets/Logo.png" alt="" aria-hidden="true" width="1440" height="430" onerror="this.remove()" />
         <p class="eyebrow">${esc(t(o.opening ? 'ov.coinToss' : 'ov.passDevice'))}</p>
         <h2><span class="team-dot big ${o.team}"></span>${esc(teamFull(o.team))}</h2>
         <p>${o.opening ? esc(t('ov.kicksOff', { team: teamName(o.team) })) + ' ' : ''}${isAiTurn ? '' : esc(t('ov.yourTurnAp', { n: g.config.apPerTurn }))}</p>

@@ -1047,3 +1047,23 @@ bdi { unicode-bidi: isolate; }
 .award-total .emoji { font-size: 20px; margin: 0; }
 @media (max-width: 1040px) { .shop-grid.bundles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 560px) { .shop-grid.bundles { grid-template-columns: minmax(0, 1fr); } }
+
+/* ------------------------------------------------------------- ADDED LOGO HERE: brand logo
+   assets/Logo.png (1440 x 430). width: 100% + height: auto keeps the aspect ratio at every size. */
+.brand { margin: 0 0 6px; line-height: 0; }
+.brand-logo { display: block; width: 100%; max-width: 560px; height: auto; margin-inline-start: -2%; filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.35)); }
+.brand .brand-fallback { display: none; line-height: 1; }
+.brand.no-logo { line-height: 1; }
+.brand.no-logo .brand-fallback { display: block; }
+@media (max-width: 760px) { .brand-logo { max-width: 440px; margin-inline: auto; } }
+
+/* Splash / loading screen (index.html). */
+.splash { min-height: 100vh; min-height: 100dvh; display: grid; place-content: center; justify-items: center; gap: 22px; padding: 24px; }
+.splash-logo { display: block; width: min(640px, 86vw); height: auto; animation: splashIn 0.6s var(--ease-out) both; }
+.splash-bar { width: min(220px, 50vw); height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
+.splash-bar i { display: block; width: 40%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--gold-deep), var(--gold-soft)); animation: splashBar 1.1s ease-in-out infinite; }
+@keyframes splashIn { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: none; } }
+@keyframes splashBar { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+
+/* Small logo on the hand-off (between turns) screen. */
+.modal-logo { display: block; width: min(200px, 60%); height: auto; margin: -6px auto 10px; opacity: 0.95; }
