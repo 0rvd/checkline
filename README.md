@@ -1,8 +1,12 @@
-# 🏟️ CHECKLINE
-
+# CHECKLINE
+<p align="center">
+  <img src="assets/gameplay.png" alt="Checkline gameplay screenshot" width="900">
+</p>
 <div align="center">
 
 ### ⚽ Football meets chess.
+
+
 
 **One pitch. Three actions. Outthink the defense.**
 
