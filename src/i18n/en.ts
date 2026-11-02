@@ -31,7 +31,7 @@ export const en = {
   'menu.tutorial.sub': '7 short lessons',
   'menu.rules': 'How to play',
   'menu.resume': 'Resume online match',
-  'menu.fine': 'Local and computer matches work offline. Online play and the leaderboard use your own Supabase project.',
+  'menu.fine': '',
   'menu.feat.dribble': 'Dribble',
   'menu.feat.pass': 'Pass',
   'menu.feat.shoot': 'Shoot',
